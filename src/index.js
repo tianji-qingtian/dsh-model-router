@@ -366,7 +366,23 @@ export function apply(ctx) {
       console.error(`dsh-model-router: pre-step cleanup failed: ${String(error)}`)
     }
 
-    const mode = state.agentModes.get(agentId) || state.globalMode
+    // Mode resolution: live in-memory state first, then the durable mode
+    // folded by the projection (survives restart — otherwise the panel shows
+    // "off" while a fresh process routes as "auto").
+    const live = state.agentModes.get(agentId)
+    let mode
+    if (live !== undefined) {
+      mode = live
+    } else if (state.globalMode !== 'auto') {
+      mode = state.globalMode
+    } else {
+      mode = 'auto'
+      try {
+        const snap = ctx.sessionProjections.snapshot(payload.agent.session)
+        const v = snap && snap.values && snap.values.modelRouter
+        if (v && v.mode === 'off') mode = 'off'
+      } catch (error) { /* ignore */ }
+    }
     if (mode !== 'auto') return next() // 'off' → quick answers disabled
 
     if (isHeavy(payload.messages)) return next() // heavy work: normal flow, no judge latency
