@@ -15,7 +15,7 @@ Model Router & Cost Optimizer for [DeepSeek Harness](https://github.com/deepseek
 ## Install
 
 ```sh
-dsh plugin --profile web add "github:YOUR_USER/dsh-model-router#main"
+dsh plugin --profile web add "github:tianji-qingtian/dsh-model-router#main"
 ```
 
 Restart `dsh --profile web`. The panel appears under the composer; the `/router` command and `route_model` tool are registered once the host half loads.
