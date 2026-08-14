@@ -14,7 +14,7 @@
  */
 import { createElement, useEffect, useRef, useState } from 'react'
 
-export const inject = ['slots', 'timer']
+export const inject = ['slots', 'timer', 'locale', 'remote', 'remote.commands']
 
 const ID = 'dsh-model-router'
 
@@ -135,11 +135,12 @@ export function apply(ctx) {
 
     const setMode = (next) => {
       setBusy(true)
-      const remote = ctx.get('remote')
-      const run = remote && remote.commands
-        ? remote.commands.execute(sessionId, '/router ' + next)
+      const run = ctx.remote && ctx.remote.commands
+        ? ctx.remote.commands.execute(sessionId, '/router ' + next)
         : Promise.reject(new Error('commands remote unavailable'))
-      run.catch(() => {}).finally(() => setBusy(false))
+      run
+        .catch((error) => console.error('dsh-model-router: set-mode failed: ' + String(error)))
+        .finally(() => setBusy(false))
     }
 
     const modeBtn = (value, label, title) => createElement('button', {
