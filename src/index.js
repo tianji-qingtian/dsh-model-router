@@ -193,6 +193,7 @@ export function apply(ctx) {
         source: { kind: 'user' },
       }],
       maxTokens: 1500,
+      reasoningEffort: 'off', // thinking would eat the token budget
       signal,
     })
     const blocks = []
@@ -226,7 +227,8 @@ export function apply(ctx) {
         }],
         source: { kind: 'user' },
       }],
-      maxTokens: 16,
+      maxTokens: 64,
+      reasoningEffort: 'off', // thinking would eat the tiny token budget
       signal,
     })
     const blocks = []
@@ -236,8 +238,13 @@ export function apply(ctx) {
         blocks.push(chunk.block.text)
       }
     }
-    const verdict = blocks.join(' ').trim().toUpperCase()
-    return verdict.startsWith('SIMPLE') ? 'cheap' : 'default'
+    const text = blocks.join(' ').trim().toUpperCase()
+    const simpleAt = text.indexOf('SIMPLE')
+    const agenticAt = text.indexOf('AGENTIC')
+    if (simpleAt === -1 && agenticAt === -1) return 'default'
+    // First occurrence wins; ties and noise resolve to the normal flow.
+    if (agenticAt !== -1 && (simpleAt === -1 || agenticAt < simpleAt)) return 'default'
+    return 'cheap'
   }
 
   // ---- session projection: durable per-session stats folded from the log ----
@@ -427,7 +434,19 @@ export function apply(ctx) {
         if (pre && pre.turn === turn) { tier = pre.tier; reason = 'heuristic' }
       }
     }
-    if (tier === null || tier === 'auto' || tier === 'base') return base
+    // No routing decision: heal drift back to the machine's default. A
+    // forged quick-answer header (or a stale persisted header after resume)
+    // must never stick — the agent's configured options are the anchor.
+    if (tier === null || tier === 'auto' || tier === 'base') {
+      const options = payload.agent && payload.agent.options
+      if (options && options.model) {
+        const provider = options.provider || base.provider
+        if (provider && (base.model !== options.model || base.provider !== provider)) {
+          return { ...base, provider, model: options.model }
+        }
+      }
+      return base
+    }
 
     const catalog = await getCatalog(base.provider)
     const target = tier === 'cheap' ? catalog.cheap : catalog.strong
