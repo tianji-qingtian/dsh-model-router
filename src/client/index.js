@@ -3,9 +3,9 @@
  *
  * A compact panel in the composer dock (`conversation.composer.dock`):
  * tier buttons (Auto / 省 / 强), the currently active model, live per-session
- * token / cache-hit / cost figures, a per-model usage breakdown, and an
- * auto-dismissing toast that pops up whenever a quick-answer subagent
- * finishes (no need to open the child session in the sidebar).
+ * token / cache-hit / cost figures, a per-model usage breakdown, and a brief
+ * inline highlight whenever a question is answered directly on the cheap
+ * model (the answer itself appears in the chat as an ordinary message).
  *
  * All read-side data flows through the `modelRouter` session projection
  * (standard `useProjection` slot prop — no RPC, reactive updates). The tier
@@ -30,13 +30,11 @@ const CSS = `
 .mrtr-meta { opacity: .65; }
 .mrtr-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin-right: 6px; }
 .mrtr-chip { opacity: .8; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mrtr-flash { color: #4ec9b0; opacity: .95; animation: mrtr-fade 6s ease-out forwards; }
+@keyframes mrtr-fade { 0% { opacity: 1; } 70% { opacity: 1; } 100% { opacity: 0; } }
 .mrtr-details { margin-top: 2px; opacity: .8; }
 .mrtr-details summary { cursor: pointer; opacity: .65; }
 .mrtr-row { display: flex; gap: 8px; padding: 1px 0; }
-.mrtr-toast { position: absolute; bottom: calc(100% + 10px); left: 50%; transform: translateX(-50%); z-index: 9999; width: max-content; max-width: 460px; background: rgba(36,36,42,.96); color: #ececec; border: 1px solid rgba(127,127,127,.45); border-radius: 10px; padding: 10px 14px; font-size: 12px; line-height: 1.5; box-shadow: 0 8px 28px rgba(0,0,0,.4); cursor: pointer; }
-.mrtr-toast-title { font-weight: 600; margin-bottom: 2px; }
-.mrtr-toast-body { opacity: .85; max-height: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.mrtr-toast-hint { margin-top: 4px; opacity: .55; font-size: 10px; }
 `
 
 /** One <style data-plugin> tag per load; the loader removes plugin-owned tags on unload. */
@@ -71,23 +69,23 @@ export function apply(ctx) {
     const stats = props.useProjection('modelRouter')
     const sessionId = props.sessionId ? String(props.sessionId) : ''
     const [busy, setBusy] = useState(false)
-    const [toast, setToast] = useState(null)
+    const [flash, setFlash] = useState(null)
     const lastQuickSeq = useRef(-1)
 
-    // Pop the toast when a new quick answer lands in the projection.
+    // Briefly highlight in the bar when a new quick answer lands (inline,
+    // not a floating toast — the answer itself is already in the chat).
     useEffect(() => {
       const q = stats && stats.lastQuick ? stats.lastQuick.seq : -1
       if (q >= 0 && q !== lastQuickSeq.current) {
         lastQuickSeq.current = q
-        setToast(stats.lastQuick)
+        setFlash(stats.lastQuick)
       }
     }, [stats])
 
-    // Auto-dismiss after 8s.
     useEffect(() => {
-      if (!toast) return undefined
-      return ctx.interval(() => setToast(null), 8000)
-    }, [toast])
+      if (!flash) return undefined
+      return ctx.interval(() => setFlash(null), 6000)
+    }, [flash])
 
     const mode = stats ? stats.mode : 'auto'
     const current = stats ? stats.current : null
@@ -140,8 +138,12 @@ export function apply(ctx) {
         }, current.model) : null,
         stats && stats.quickAnswers > 0 ? createElement('span', {
           className: 'mrtr-meta',
-          title: 'trivial questions answered by an isolated quick-answer agent on the cheap model',
+          title: 'trivial questions answered directly on the cheap model',
         }, 'QA×' + stats.quickAnswers) : null,
+        flash ? createElement('span', {
+          className: 'mrtr-flash',
+          title: 'this question was answered directly on the cheap model',
+        }, '⚡' + (flash.model || 'flash') + ' 已作答') : null,
         totals ? createElement('span', { className: 'mrtr-meta', title: 'estimated cost; input excludes cache hits (disjoint counts), prices are configurable estimates' },
           'miss ' + fmt(totals.inTokens)
           + ' · out ' + fmt(totals.outTokens)
@@ -151,12 +153,6 @@ export function apply(ctx) {
       Object.keys(byModel || {}).length > 0 ? createElement('details', { className: 'mrtr-details' },
         createElement('summary', null, 'usage (' + (totals ? totals.calls : 0) + ' calls)'),
         modelRows) : null,
-      toast ? createElement('div', { className: 'mrtr-toast', onClick: () => setToast(null) },
-        createElement('div', { className: 'mrtr-toast-title' },
-          '⚡ quick-answer 已完成（' + (toast.model || 'cheap model') + '）'),
-        toast.preview ? createElement('div', { className: 'mrtr-toast-body' }, toast.preview + ' …') : null,
-        createElement('div', { className: 'mrtr-toast-hint' }, '答案已回填对话 · 点击关闭'),
-      ) : null,
     )
   }
 

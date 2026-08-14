@@ -30,7 +30,7 @@
 import z from 'zod'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
-export const inject = ['llm', 'tools', 'sessionProjections', 'subagents']
+export const inject = ['llm', 'tools', 'sessionProjections']
 
 const CHEAP_RE = /(flash|chat|mini|turbo|haiku|lite|air|nano)/i
 const STRONG_RE = /(pro|reasoner|opus|sonnet|max|ultra|premium|r1)/i
@@ -151,7 +151,6 @@ export function apply(ctx) {
     degraded: new Map(),   // agentId -> turn number where degraded began
     sticky: new Map(),     // agentId -> { turn, tier }
     preStep: new Map(),    // agentId -> { turn, tier }
-    quickKids: new Set(),  // agentIds of quick-answer children (recursion guard)
     fallbacks: 0,
     baseModel: new Map(),  // agentId -> machine's original model
     provider: new Map(),   // agentId -> provider route
@@ -179,6 +178,38 @@ export function apply(ctx) {
     return entry
   }
 
+  /**
+   * Zero-prefix one-shot answer on the cheap model. Returns the plain text
+   * or null when the stream produced nothing (caller falls back to the
+   * normal flow).
+   */
+  async function answerOnCheap(provider, model, question, signal) {
+    const stream = ctx.llm.stream({
+      provider,
+      model,
+      messages: [{
+        id: `mrtr-ask-${Date.now()}`,
+        role: 'user',
+        content: [{
+          type: 'text',
+          text: 'Answer the following question directly and concisely. Output only the answer, no preamble.\n\n' + question,
+        }],
+        source: { kind: 'user' },
+      }],
+      maxTokens: 1500,
+      signal,
+    })
+    const blocks = []
+    for await (const chunk of stream) {
+      if (chunk.type === 'block-end' && chunk.block && chunk.block.type === 'text'
+        && typeof chunk.block.text === 'string') {
+        blocks.push(chunk.block.text)
+      }
+    }
+    const text = blocks.join('\n\n').trim()
+    return text.length > 0 ? text : null
+  }
+
   // ---- session projection: durable per-session stats folded from the log ----
   ctx.sessionProjections.register({
     key: 'modelRouter',
@@ -187,28 +218,54 @@ export function apply(ctx) {
     apply(state, event) {
       // SessionEvent shape: { type, seq, time, data: <payload>, ... } — the
       // payload lives under `data`.
-      if (event.type === 'user/message') {
-        // Quick-answer relay injections (our plugin-sourced context):
-        // count them and remember the latest one for the toast.
-        const msg = event.data
-        if (msg && msg.source && msg.source.kind === 'plugin' && msg.source.plugin === 'dsh-model-router') {
-          const id = String(msg.id || '')
-          const prefix = 'mrtr-qa-'
-          const turn = id.startsWith(prefix) && id.lastIndexOf('-') >= prefix.length
-            ? id.slice(id.lastIndexOf('-') + 1)
-            : ''
-          const model = id.startsWith(prefix) && id.lastIndexOf('-') >= prefix.length
-            ? id.slice(prefix.length, id.lastIndexOf('-'))
-            : ''
-          const texts = Array.isArray(msg.content)
-            ? msg.content.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text)
+      if (event.type === 'assistant/message') {
+        // Direct quick answers (forged step, id prefix mrtr-ans-): count
+        // them and remember the latest one for the panel indicator.
+        const data = event.data
+        const message = data && data.message
+        if (message && typeof message.id === 'string' && message.id.startsWith('mrtr-ans-')) {
+          const model = (message.source && message.source.model) ? String(message.source.model) : ''
+          const texts = Array.isArray(message.content)
+            ? message.content.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text)
             : []
-          const preview = (texts.slice(1).join(' ').trim() || '').slice(0, 200)
           return {
             ...state,
             quickAnswers: state.quickAnswers + 1,
-            lastQuick: { seq: Number(event.seq ?? 0), turn, model, preview },
+            lastQuick: {
+              seq: Number(event.seq ?? 0),
+              turn: String((data && data.turn) || ''),
+              model,
+              preview: texts.join(' ').trim().slice(0, 200),
+            },
           }
+        }
+        if (event.data && event.data.usage) {
+          const u = event.data.usage
+          const model = String((state.current && state.current.model) || 'unknown')
+          const prev = state.byModel[model] || {
+            calls: 0, inTokens: 0, outTokens: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0,
+          }
+          const byModel = {
+            ...state.byModel,
+            [model]: {
+              calls: prev.calls + 1,
+              inTokens: prev.inTokens + (u.inputTokens || 0),
+              outTokens: prev.outTokens + (u.outputTokens || 0),
+              cacheRead: prev.cacheRead + (u.cacheReadTokens || 0),
+              cacheWrite: prev.cacheWrite + (u.cacheWriteTokens || 0),
+              reasoning: prev.reasoning + (u.reasoningTokens || 0),
+            },
+          }
+          const totals = {
+            calls: state.totals.calls + 1,
+            inTokens: state.totals.inTokens + (u.inputTokens || 0),
+            outTokens: state.totals.outTokens + (u.outputTokens || 0),
+            cacheRead: state.totals.cacheRead + (u.cacheReadTokens || 0),
+            cacheWrite: state.totals.cacheWrite + (u.cacheWriteTokens || 0),
+            reasoning: state.totals.reasoning + (u.reasoningTokens || 0),
+            cost: state.totals.cost + usageCost(model, u),
+          }
+          return { ...state, byModel, totals }
         }
         return state
       }
@@ -230,34 +287,6 @@ export function apply(ctx) {
         if (mode === null || state.mode === mode) return state
         return { ...state, mode }
       }
-      if (event.type === 'assistant/message' && event.data && event.data.usage) {
-        const u = event.data.usage
-        const model = String((state.current && state.current.model) || 'unknown')
-        const prev = state.byModel[model] || {
-          calls: 0, inTokens: 0, outTokens: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0,
-        }
-        const byModel = {
-          ...state.byModel,
-          [model]: {
-            calls: prev.calls + 1,
-            inTokens: prev.inTokens + (u.inputTokens || 0),
-            outTokens: prev.outTokens + (u.outputTokens || 0),
-            cacheRead: prev.cacheRead + (u.cacheReadTokens || 0),
-            cacheWrite: prev.cacheWrite + (u.cacheWriteTokens || 0),
-            reasoning: prev.reasoning + (u.reasoningTokens || 0),
-          },
-        }
-        const totals = {
-          calls: state.totals.calls + 1,
-          inTokens: state.totals.inTokens + (u.inputTokens || 0),
-          outTokens: state.totals.outTokens + (u.outputTokens || 0),
-          cacheRead: state.totals.cacheRead + (u.cacheReadTokens || 0),
-          cacheWrite: state.totals.cacheWrite + (u.cacheWriteTokens || 0),
-          reasoning: state.totals.reasoning + (u.reasoningTokens || 0),
-          cost: state.totals.cost + usageCost(model, u),
-        }
-        return { ...state, byModel, totals }
-      }
       return state
     },
     view(state) {
@@ -266,7 +295,7 @@ export function apply(ctx) {
     stateVersion: 1,
   })
 
-  // ---- classify each step; route cheap questions to a quick-answer child ----
+  // ---- classify each step; cheap questions are answered directly on flash ----
   ctx.on('agent/pre-step', async (payload, next) => {
     const agentId = String(payload.agent.id)
     try {
@@ -278,7 +307,6 @@ export function apply(ctx) {
 
     const mode = state.agentModes.get(agentId) || state.globalMode
     if (mode !== 'auto') return next() // manual mode owns routing entirely
-    if (state.quickKids.has(agentId)) return next() // never re-spawn from a child
 
     const tier = classify(payload.messages)
     if (tier === 'strong') {
@@ -287,13 +315,13 @@ export function apply(ctx) {
     }
     if (tier !== 'cheap') return next()
 
-    // Cheap question: answer it in a fresh quick-answer child on the cheap
-    // model (zero prefix -> no cache-miss tax), then feed the answer back
-    // into this conversation. The main session never flips model, so its
-    // prefix cache stays intact.
+    // Cheap question: answer it with a zero-prefix one-shot stream on the
+    // cheap model, then write the exchange straight into the session log
+    // inside a forged step envelope. No subagent session (nothing piles up
+    // in the sidebar), no relay card, and the main model never runs for it.
     try {
       // Only genuine user turns: every claimed message must be user-sourced
-      // (tool results / steering / our own relay injections are excluded).
+      // (tool results / steering / injections are excluded).
       if (payload.messages.length === 0
         || !payload.messages.every((m) => m && m.source && m.source.kind === 'user')) return next()
       const question = newestText(payload.messages[payload.messages.length - 1])
@@ -302,46 +330,31 @@ export function apply(ctx) {
       if (!provider) return next()
       const catalog = await getCatalog(provider)
       if (!catalog.cheap) return next()
-      const subagentProviders = ctx.subagents.list()
-      if (!Array.isArray(subagentProviders) || subagentProviders.length === 0) return next()
 
-      const run = await ctx.subagents.start(subagentProviders[0], {
-        label: 'quick-answer',
-        prompt: [{
-          type: 'text',
-          text: 'Answer the following question directly and concisely. Do not use tools. Output only the answer.\n\n' + question,
-        }],
-        parent: payload.agent,
-        signal: payload.signal,
-        agentOptions: { provider, model: catalog.cheap },
-      })
-      state.quickKids.add(String(run.id))
-      try {
-        const result = await run.result
-        const output = Array.isArray(result.output)
-          ? result.output.filter((b) => b && b.type === 'text')
-          : []
-        if (result.stopReason === 'completed' && output.length > 0) {
-          // Re-queue the original question (claim removed it from the inbox)
-          // and the relay instruction, then reject this step so the main
-          // model never answers the question itself.
-          for (const message of payload.messages) payload.agent.inject(message)
-          payload.agent.inject({
-            id: `mrtr-qa-${catalog.cheap}-${payload.turn}`,
-            role: 'user',
-            content: [
-              { type: 'text', text: `⚡ Quick-answer subagent (${catalog.cheap}, isolated session) already answered the question above. Reply to the user with that answer exactly as written — do not re-answer, add analysis, or call tools.` },
-              ...output,
-            ],
-            source: { kind: 'plugin', plugin: 'dsh-model-router' },
-          })
-          console.log(`dsh-model-router: quick-answer #${payload.turn} via ${catalog.cheap}`)
-          return { kind: 'reject' }
-        }
-      } finally {
-        await run.dispose().catch(() => {})
-        state.quickKids.delete(String(run.id))
+      const answer = await answerOnCheap(provider, catalog.cheap, question, payload.signal)
+      if (answer === null) return next()
+
+      // Log the exchange. At pre-step time the current step has not started
+      // yet, so step/start..assistant/message..step/end with payload.step
+      // satisfies the session invariants.
+      const session = payload.agent.session
+      for (const message of payload.messages) {
+        session.append('user/message', message, { surfaceOp: 'append' })
       }
+      session.append('step/start', { turn: payload.turn, step: payload.step })
+      session.append('assistant/message', {
+        turn: payload.turn,
+        step: payload.step,
+        message: {
+          id: `mrtr-ans-${agentId}-${payload.turn}-${payload.step}`,
+          role: 'assistant',
+          content: [{ type: 'text', text: answer }],
+          source: { kind: 'model', provider, model: catalog.cheap },
+        },
+      }, { surfaceOp: 'append' })
+      session.append('step/end', { turn: payload.turn, step: payload.step })
+      console.log(`dsh-model-router: quick-answer #${payload.turn} via ${catalog.cheap} (direct)`)
+      return { kind: 'reject' }
     } catch (error) {
       console.error(`dsh-model-router: quick-answer failed: ${String(error)}`)
     }

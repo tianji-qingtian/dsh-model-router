@@ -7,10 +7,10 @@ Model Router & Cost Optimizer for [DeepSeek Harness](https://github.com/deepseek
 ## Features
 
 - **Heuristic tier routing** — at turn start the *newest user message* is classified (`agent/pre-step`: task keywords + payload size; history is deliberately ignored so a long agentic conversation can still catch a trivial follow-up). Agentic work (实现 / 重构 / 调试 …) routes to the strong catalog model. The chosen tier is **sticky within a turn**.
-- **Isolated quick-answer** — trivial prompts (什么是 / 是什么 / 解释 / 翻译 / hello …) are *not* answered by the main session at all. The router rejects the step, spawns a **fresh `quick-answer` subagent on the cheap model** (zero prefix → no cache-miss tax), and feeds its answer back into the conversation as a plugin context card; the main model relays it verbatim. The main session's model and prefix cache are never touched, so there is no switching penalty in long cached sessions — the trade-off is one extra relay call instead of a model flip. Manual mode (`/router`, `route_model`, dock buttons) disables quick-answering.
+- **Direct quick-answer** — trivial prompts (什么是 / 是什么 / 解释 / 翻译 / hello …) are *not* answered by the main session at all. The router rejects the step, runs a **zero-prefix one-shot stream on the cheap model** (no cache-miss tax), and writes the question + answer straight into the session log inside a step envelope — the user sees an ordinary Q&A exchange, the main model never runs for it, and **no subagent sessions, relay cards, or toasts are created**. The main session's model and prefix cache are never touched. Manual mode (`/router`, `route_model`, dock buttons) disables quick-answering.
 - **Automatic fallback** — transient failures (`RATE_LIMIT`, `SERVER`, `TIMEOUT`, `EMPTY_RESPONSE`) degrade the turn to the cheap model and retry once; anything else delegates to the provider's own retry policy.
 - **Real usage metering** — a session projection folds the durable log: real adapter token usage (input / output / cache read / cache write / reasoning), per-model breakdown, and estimated cost from a model-class price table. Projection-based, so the numbers are replay-safe and survive cold sessions.
-- **Composer dock panel** — tier buttons (Auto / 省 / 强), current model, `miss/out/cache%/≈$` line, a `QA×N` quick-answer counter, and a per-model usage breakdown. Reactively driven by `useProjection`; buttons reuse the built-in `commands` remote — no custom wire protocol. Each completed quick answer also pops an auto-dismissing toast above the composer (model used + answer preview), so there is nothing to click in the sidebar.
+- **Composer dock panel** — tier buttons (Auto / 省 / 强), current model, `miss/out/cache%/≈$` line, a `QA×N` quick-answer counter (with a brief inline highlight on each direct answer), and a per-model usage breakdown. Reactively driven by `useProjection`; buttons reuse the built-in `commands` remote — no custom wire protocol.
 - **Manual control** — `/router auto|cheap|strong` slash command, and a model-visible `route_model` tool so the agent itself can request a tier mid-task.
 
 ## Install
@@ -46,10 +46,10 @@ After the restart the ⚡Router panel appears under the composer in the Web UI, 
 | Piece | Mechanism |
 | --- | --- |
 | Step classification | `agent/pre-step` waterfall — newest user message, keyword + size heuristics |
-| Quick answers | `agent/pre-step` rejects the step after spawning a one-shot `subagents.start` child on the cheap model; the child's answer is re-injected via `agent.inject` and relayed by the main model |
+| Quick answers | `agent/pre-step` rejects the step after a zero-prefix `llm.stream` on the cheap model; the question + answer are appended to the session log (`user/message` + a forged `step/start`…`assistant/message`…`step/end` envelope) — the main model never runs |
 | Model substitution (strong/manual tiers) | `agent/request` waterfall — replaces the call config's `model` |
 | Failure fallback | `agent/request-error` waterfall — returns `{ kind: 'retry' }` after flagging the turn; the retry re-enters `agent/request` and lands on the cheap model |
-| Stats | `sessionProjections.register('modelRouter', …)` folded over `request/header`, `command/run`, `user/message` (quick-answer count), and `assistant/message` events |
+| Stats | `sessionProjections.register('modelRouter', …)` folded over `request/header`, `command/run`, and `assistant/message` events (usage + `mrtr-ans-` quick answers) |
 | Dock UI | `conversation.composer.dock` slot + standard `useProjection` prop |
 | Manual control | `/router` command (`commands` service) + `route_model` tool (`tools` registry) |
 
@@ -74,7 +74,7 @@ Edit it to match your account's actual pricing; the panel always labels the numb
 
 - The router is a static plugin: routing state (mode, degradation) is process-local and resets with the harness. Durable numbers live in the projection.
 - `useProjection`-driven stats reflect the whole session log — history recorded before installation is included, which is intentional.
-- Quick answers add one relay call (the main model restates the child's answer), so for very short answers the total cost is roughly break-even vs. answering on the strong model; the win grows with answer length and with heavy contexts where a model flip would be expensive.
+- Direct quick answers write a forged step envelope into the session log. This satisfies the current session invariants (the step is appended before the real step starts), but it is the most harness-coupled part of the plugin — worth re-checking after harness upgrades. The cheap-model tokens of quick answers are deliberately not included in the panel's usage figures.
 
 ## License
 
