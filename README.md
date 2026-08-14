@@ -6,8 +6,8 @@ Model Router & Cost Optimizer for [DeepSeek Harness](https://github.com/deepseek
 
 ## Features
 
-- **Heuristic tier routing** — at turn start the *newest user message* is classified (`agent/pre-step`: task keywords + payload size; history is deliberately ignored so a long agentic conversation can still catch a trivial follow-up). Agentic work (实现 / 重构 / 调试 …) routes to the strong catalog model. The chosen tier is **sticky within a turn**.
-- **Direct quick-answer** — trivial prompts (什么是 / 是什么 / 解释 / 翻译 / hello …) are *not* answered by the main session at all. The router rejects the step, runs a **zero-prefix one-shot stream on the cheap model** (no cache-miss tax), and writes the question + answer straight into the session log inside a step envelope — the user sees an ordinary Q&A exchange, the main model never runs for it, and **no subagent sessions, relay cards, or toasts are created**. The main session's model and prefix cache are never touched. Manual mode (`/router`, `route_model`, dock buttons) disables quick-answering.
+- **Cheap-model judge routing** — clearly heavy work (strong keywords / long payloads) goes straight to the strong model with zero added latency. Everything else is decided by a **zero-prefix flash judge call** (`SIMPLE` / `AGENTIC`, one word, ~16-token cap): SIMPLE requests are answered directly on the cheap model, AGENTIC ones take the normal flow. A hand-written keyword list can never misroute a simple question again.
+- **Direct quick-answer** — SIMPLE prompts are *not* answered by the main session at all. The router rejects the step, runs a **zero-prefix one-shot stream on the cheap model** (no cache-miss tax), and writes the question + answer straight into the session log inside a step envelope — the user sees an ordinary Q&A exchange prefixed with a `⚡ 快速回答 · <model>` marker, the main model never runs for it, and **no subagent sessions, relay cards, or toasts are created**. The main session's model and prefix cache are never touched. Manual mode (`/router`, `route_model`, dock buttons) disables quick-answering.
 - **Automatic fallback** — transient failures (`RATE_LIMIT`, `SERVER`, `TIMEOUT`, `EMPTY_RESPONSE`) degrade the turn to the cheap model and retry once; anything else delegates to the provider's own retry policy.
 - **Real usage metering** — a session projection folds the durable log: real adapter token usage (input / output / cache read / cache write / reasoning), per-model breakdown, and estimated cost from a model-class price table. Projection-based, so the numbers are replay-safe and survive cold sessions.
 - **Composer dock panel** — tier buttons (Auto / 省 / 强), current model, `miss/out/cache%/≈$` line, a `QA×N` quick-answer counter (with a brief inline highlight on each direct answer), and a per-model usage breakdown. Reactively driven by `useProjection`; buttons reuse the built-in `commands` remote — no custom wire protocol.
@@ -45,7 +45,7 @@ After the restart the ⚡Router panel appears under the composer in the Web UI, 
 
 | Piece | Mechanism |
 | --- | --- |
-| Step classification | `agent/pre-step` waterfall — newest user message, keyword + size heuristics |
+| Step classification | `agent/pre-step` waterfall — strong-keyword fast path, then a zero-prefix flash judge call (SIMPLE / AGENTIC) |
 | Quick answers | `agent/pre-step` rejects the step after a zero-prefix `llm.stream` on the cheap model; the question + answer are appended to the session log (`user/message` + a forged `step/start`…`assistant/message`…`step/end` envelope) — the main model never runs |
 | Model substitution (strong/manual tiers) | `agent/request` waterfall — replaces the call config's `model` |
 | Failure fallback | `agent/request-error` waterfall — returns `{ kind: 'retry' }` after flagging the turn; the retry re-enters `agent/request` and lands on the cheap model |

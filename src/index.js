@@ -111,11 +111,11 @@ function newestText(message) {
 }
 
 function classify(messages) {
+  // Fast path ONLY for clearly heavy work — everything else is decided by
+  // the cheap-model judge, so a fragile keyword list can never misroute a
+  // simple question. Only the newest USER message is inspected; mid-turn
+  // steps end with assistant/tool messages and stay on the sticky tier.
   if (!Array.isArray(messages) || messages.length === 0) return 'auto'
-  // Only the newest USER message decides the turn tier. Scanning the whole
-  // step history lets old keywords dominate: a long agentic conversation
-  // would never route a trivial follow-up question cheap. Mid-turn steps
-  // end with assistant/tool messages — leave those to the sticky tier.
   const last = messages[messages.length - 1]
   if (!last || last.role !== 'user') return 'auto'
   const content = last.content
@@ -130,13 +130,9 @@ function classify(messages) {
   }
   let score = Math.min(toolBlocks, 8) * 0.5
   const strongWords = /(实现|重构|修复|调试|排查|设计|架构|优化|审计|迁移|评审|implement|refactor|debug|design|architect|migrate|audit|investigate|analy[sz]e)/gi
-  const cheapWords = /(你好|什么是|是什么|什么意思|解释|总结|翻译|写首诗|讲个笑话|推荐|打招呼|hello|what is|explain|summarize|translate)/gi
   score += (text.match(strongWords) || []).length
-  score -= (text.match(cheapWords) || []).length
   if (text.length > 4000) score += 1
-  if (score >= 2) return 'strong'
-  if (score <= -1) return 'cheap'
-  return 'auto'
+  return score >= 2 ? 'strong' : 'auto'
 }
 
 const emptyTotals = () => ({
@@ -210,6 +206,38 @@ export function apply(ctx) {
     }
     const text = blocks.join('\n\n').trim()
     return text.length > 0 ? { text, usage } : null
+  }
+
+  /**
+   * Cheap-model judge: decide whether a request is a simple direct question
+   * or agentic work. Returns 'cheap' for SIMPLE, 'default' otherwise (the
+   * caller keeps the normal flow on any ambiguity or failure).
+   */
+  async function flashJudge(provider, model, question, signal) {
+    const stream = ctx.llm.stream({
+      provider,
+      model,
+      messages: [{
+        id: `mrtr-judge-${Date.now()}`,
+        role: 'user',
+        content: [{
+          type: 'text',
+          text: 'Classify this request. Reply with exactly one word: SIMPLE if it is a quick factual question answerable directly in a few sentences without tools, files, code, or deep analysis (definitions, explanations, translations, small talk, trivia). AGENTIC if it needs tools, code, files, research, or multi-step work.\n\nRequest: ' + question.slice(0, 500),
+        }],
+        source: { kind: 'user' },
+      }],
+      maxTokens: 16,
+      signal,
+    })
+    const blocks = []
+    for await (const chunk of stream) {
+      if (chunk.type === 'block-end' && chunk.block && chunk.block.type === 'text'
+        && typeof chunk.block.text === 'string') {
+        blocks.push(chunk.block.text)
+      }
+    }
+    const verdict = blocks.join(' ').trim().toUpperCase()
+    return verdict.startsWith('SIMPLE') ? 'cheap' : 'default'
   }
 
   // ---- session projection: durable per-session stats folded from the log ----
@@ -316,12 +344,12 @@ export function apply(ctx) {
       state.preStep.set(agentId, { turn: payload.turn, tier: 'strong' })
       return next()
     }
-    if (tier !== 'cheap') return next()
 
-    // Cheap question: answer it with a zero-prefix one-shot stream on the
-    // cheap model, then write the exchange straight into the session log
-    // inside a forged step envelope. No subagent session (nothing piles up
-    // in the sidebar), no relay card, and the main model never runs for it.
+    // Not clearly heavy: let the cheap model judge SIMPLE vs AGENTIC, then
+    // answer SIMPLE requests with a zero-prefix one-shot stream on the cheap
+    // model, written straight into the session log inside a forged step
+    // envelope. No subagent session (nothing piles up in the sidebar), no
+    // relay card, and the main model never runs for simple questions.
     try {
       // Only genuine user turns: every claimed message must be user-sourced
       // (tool results / steering / injections are excluded).
@@ -333,6 +361,9 @@ export function apply(ctx) {
       if (!provider) return next()
       const catalog = await getCatalog(provider)
       if (!catalog.cheap) return next()
+
+      const verdict = await flashJudge(provider, catalog.cheap, question, payload.signal)
+      if (verdict !== 'cheap') return next()
 
       const answer = await answerOnCheap(provider, catalog.cheap, question, payload.signal)
       if (answer === null) return next()
@@ -356,7 +387,10 @@ export function apply(ctx) {
         message: {
           id: `mrtr-ans-${agentId}-${payload.turn}-${payload.step}`,
           role: 'assistant',
-          content: [{ type: 'text', text: answer.text }],
+          content: [{
+            type: 'text',
+            text: `> ⚡ 快速回答 · ${catalog.cheap}\n\n${answer.text}`,
+          }],
           source: { kind: 'model', provider, model: catalog.cheap },
         },
       }
