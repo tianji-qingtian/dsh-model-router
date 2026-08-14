@@ -16,6 +16,16 @@ Model Router & Cost Optimizer for [DeepSeek Harness](https://github.com/deepseek
 - **Real usage metering** — a session projection folds the durable log: real adapter token usage (input / output / cache read / cache write / reasoning), per-model breakdown, and estimated cost from a model-class price table. Projection-based, so the numbers are replay-safe and survive cold sessions.
 - **Composer dock panel (i18n zh/en)** — Auto / 关闭 toggle, current model, `miss/out/cache%/≈$` line, a `QA×N` quick-answer counter (with a brief inline highlight on each direct answer), and a per-model usage breakdown. Reactively driven by `useProjection`; the toggle reuses the built-in `commands` remote — no custom wire protocol. UI strings are localized through the harness `locale` service.
 
+## Screenshots
+
+Quick answers land as ordinary chat messages with a `⚡ 快速回答 / Quick answer` marker:
+
+![quick answer demo](imgs/demo1.png)
+
+The router dock under the composer — Auto / 关闭 toggle, current model, live token / cache-hit / cost figures, and the per-model usage breakdown:
+
+![router dock panel](imgs/demo2.png)
+
 ## Install
 
 ### Prerequisites

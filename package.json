@@ -1,6 +1,6 @@
 {
   "name": "dsh-model-router",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Model router & cost optimizer for DeepSeek Harness: heuristic tier routing between cheap and strong models, automatic fallback on transient failures, and a per-session token/cache/cost panel in the composer dock.",
   "type": "module",
   "packageManager": "pnpm@11.14.0",
