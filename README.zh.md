@@ -31,8 +31,8 @@ npm install -g @deepseek-ai/dsh
 
 ```sh
 # 1. 把 bundle 加入你的 web profile（pnpm 执行；lib/ 产物已提交在仓库里，
-#    安装时不跑构建脚本）
-dsh plugin --profile web add "github:tianji-qingtian/dsh-model-router#main"
+#    安装时不跑构建脚本）。推荐用 release tag（#v0.7.2）；#main 跟随最新提交。
+dsh plugin --profile web add "github:tianji-qingtian/dsh-model-router#v0.7.2"
 
 # 2. 用该 profile 重启 harness —— add 只改 profile 文件，
 #    运行中的实例不会热加载新 bundle
@@ -74,7 +74,7 @@ const PRICE_TABLE = [
 
 ## 已知限制
 
-- 静态插件：路由状态（mode、降级）是进程本地的，随 harness 重置。持久化数字在投影里。
+- 路由状态分两部分：auto/off 模式是**持久**的（由投影从会话 `command/run` 事件折叠，重启后保持），瞬态降级标记是进程本地的，随 harness 重置。
 - `useProjection` 驱动的统计反映整段会话日志 —— 安装前的历史也会计入，这是有意的。
 - 直答会把伪造 step 包络（外加一条 `request/header` 用于归因）写进会话日志。它满足当前会话不变量（步骤在真实 step 开始前追加），但这是插件与 harness 耦合最深的部分，harness 升级后值得复查。
 

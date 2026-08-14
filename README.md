@@ -31,8 +31,9 @@ npm install -g @deepseek-ai/dsh
 
 ```sh
 # 1. add the bundle to your web profile (pnpm-backed; the built lib/ artifacts
-#    are committed in this repo, so no build script runs at install time)
-dsh plugin --profile web add "github:tianji-qingtian/dsh-model-router#main"
+#    are committed in this repo, so no build script runs at install time).
+#    Prefer a release tag (#v0.7.2); #main tracks the latest commit.
+dsh plugin --profile web add "github:tianji-qingtian/dsh-model-router#v0.7.2"
 
 # 2. restart the harness with that profile — `add` only edits the profile
 #    files; a running instance does not hot-load the new bundle
@@ -74,7 +75,7 @@ Edit it to match your account's actual pricing; the panel always labels the numb
 
 ## Known limitations
 
-- The router is a static plugin: routing state (mode, degradation) is process-local and resets with the harness. Durable numbers live in the projection.
+- Routing state is split: the auto/off mode is **durable** (folded by the projection from the session's `command/run` events, so it survives restarts), while the transient-failure degradation flag is process-local and resets with the harness.
 - `useProjection`-driven stats reflect the whole session log — history recorded before installation is included, which is intentional.
 - Direct quick answers write a forged step envelope (plus a `request/header` for attribution) into the session log. This satisfies the current session invariants (the step is appended before the real step starts), but it is the most harness-coupled part of the plugin — worth re-checking after harness upgrades.
 
