@@ -15,10 +15,16 @@ Model Router & Cost Optimizer for [DeepSeek Harness](https://github.com/deepseek
 ## Install
 
 ```sh
+# 1. add the bundle to your web profile (pnpm-backed; runs the package's prepare build)
 dsh plugin --profile web add "github:tianji-qingtian/dsh-model-router#main"
+
+# 2. restart the harness with that profile
+dsh --profile web
 ```
 
-Restart `dsh --profile web`. The panel appears under the composer; the `/router` command and `route_model` tool are registered once the host half loads.
+After the restart the ⚡Router panel appears under the composer in the Web UI, and the `/router` command plus the `route_model` tool are registered once the host half loads. Verify under Settings → Plugins that `dsh-model-router` is listed.
+
+> A dynamic (session-only) prototype with the same name may already be running inside one session; it is unrelated to the installed bundle and disappears with the harness process.
 
 ## How it works
 
@@ -45,6 +51,8 @@ const PRICE_TABLE = [
 ```
 
 Edit it to match your account's actual pricing; the panel always labels the number with `≈`. Cache hits are billed at the cache-hit price, not the input price.
+
+**Counting semantics:** harness `TokenUsage` fields are *disjoint* — `inputTokens` already excludes cache reads (DeepSeek reports `prompt_tokens = hit + miss`; the adapter subtracts hits out). The panel therefore shows `miss … · cache N%` where the hit rate is `hit / (hit + miss)`; a healthy long conversation typically sits in the high 90s.
 
 ## Known limitations
 

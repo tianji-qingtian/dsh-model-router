@@ -70,8 +70,11 @@ export function apply(ctx) {
     const current = stats ? stats.current : null
     const totals = stats ? stats.totals : null
     const byModel = stats ? stats.byModel : null
-    const cacheHitRate = totals && totals.inTokens > 0
-      ? Math.round((totals.cacheRead / totals.inTokens) * 100)
+    // inputTokens excludes cache reads (disjoint harness counts): the hit rate
+    // is hit / (hit + miss).
+    const totalPrompt = totals ? totals.inTokens + totals.cacheRead : 0
+    const cacheHitRate = totalPrompt > 0
+      ? Math.round((totals.cacheRead / totalPrompt) * 100)
       : 0
 
     const setMode = (tier) => {
@@ -112,8 +115,8 @@ export function apply(ctx) {
           className: 'mrtr-chip',
           title: current.provider + ' / ' + current.model,
         }, current.model) : null,
-        totals ? createElement('span', { className: 'mrtr-meta', title: 'estimated cost; prices are configurable estimates' },
-          'in ' + fmt(totals.inTokens)
+        totals ? createElement('span', { className: 'mrtr-meta', title: 'estimated cost; input excludes cache hits (disjoint counts), prices are configurable estimates' },
+          'miss ' + fmt(totals.inTokens)
           + ' · out ' + fmt(totals.outTokens)
           + ' · cache ' + cacheHitRate + '%'
           + ' · ≈$' + fmtCost(totals.cost)) : null,

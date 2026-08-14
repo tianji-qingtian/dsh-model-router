@@ -87,7 +87,9 @@ function usageCost(model, usage) {
   const input = usage.inputTokens || 0
   const output = usage.outputTokens || 0
   const cacheRead = usage.cacheReadTokens || 0
-  return ((input - cacheRead) / 1e6) * price.input
+  // Harness TokenUsage is DISJOINT: inputTokens already excludes cache reads
+  // (DeepSeek prompt_tokens = hit + miss; the adapter subtracts hits out).
+  return (input / 1e6) * price.input
     + (cacheRead / 1e6) * price.cacheHit
     + (output / 1e6) * price.output
 }
