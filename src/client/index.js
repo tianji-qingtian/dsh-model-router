@@ -3,7 +3,9 @@
  *
  * A compact panel in the composer dock (`conversation.composer.dock`):
  * tier buttons (Auto / 省 / 强), the currently active model, live per-session
- * token / cache-hit / cost figures, and a per-model usage breakdown.
+ * token / cache-hit / cost figures, a per-model usage breakdown, and an
+ * auto-dismissing toast that pops up whenever a quick-answer subagent
+ * finishes (no need to open the child session in the sidebar).
  *
  * All read-side data flows through the `modelRouter` session projection
  * (standard `useProjection` slot prop — no RPC, reactive updates). The tier
@@ -11,14 +13,14 @@
  * commands remote (`ctx.remote.commands.execute`), so no custom wire protocol
  * is invented here.
  */
-import { createElement, useState } from 'react'
+import { createElement, useEffect, useRef, useState } from 'react'
 
-export const inject = ['slots']
+export const inject = ['slots', 'timer']
 
 const ID = 'dsh-model-router'
 
 const CSS = `
-.mrtr { font-size: 11px; line-height: 1.5; opacity: .92; }
+.mrtr { position: relative; font-size: 11px; line-height: 1.5; opacity: .92; }
 .mrtr-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .mrtr-label { font-weight: 600; opacity: .7; }
 .mrtr-btn { border: 1px solid rgba(127,127,127,.35); background: transparent; color: inherit; border-radius: 999px; padding: 1px 8px; font-size: 11px; cursor: pointer; opacity: .7; }
@@ -31,6 +33,10 @@ const CSS = `
 .mrtr-details { margin-top: 2px; opacity: .8; }
 .mrtr-details summary { cursor: pointer; opacity: .65; }
 .mrtr-row { display: flex; gap: 8px; padding: 1px 0; }
+.mrtr-toast { position: absolute; bottom: calc(100% + 10px); left: 50%; transform: translateX(-50%); z-index: 9999; width: max-content; max-width: 460px; background: rgba(36,36,42,.96); color: #ececec; border: 1px solid rgba(127,127,127,.45); border-radius: 10px; padding: 10px 14px; font-size: 12px; line-height: 1.5; box-shadow: 0 8px 28px rgba(0,0,0,.4); cursor: pointer; }
+.mrtr-toast-title { font-weight: 600; margin-bottom: 2px; }
+.mrtr-toast-body { opacity: .85; max-height: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mrtr-toast-hint { margin-top: 4px; opacity: .55; font-size: 10px; }
 `
 
 /** One <style data-plugin> tag per load; the loader removes plugin-owned tags on unload. */
@@ -65,6 +71,23 @@ export function apply(ctx) {
     const stats = props.useProjection('modelRouter')
     const sessionId = props.sessionId ? String(props.sessionId) : ''
     const [busy, setBusy] = useState(false)
+    const [toast, setToast] = useState(null)
+    const lastQuickSeq = useRef(-1)
+
+    // Pop the toast when a new quick answer lands in the projection.
+    useEffect(() => {
+      const q = stats && stats.lastQuick ? stats.lastQuick.seq : -1
+      if (q >= 0 && q !== lastQuickSeq.current) {
+        lastQuickSeq.current = q
+        setToast(stats.lastQuick)
+      }
+    }, [stats])
+
+    // Auto-dismiss after 8s.
+    useEffect(() => {
+      if (!toast) return undefined
+      return ctx.interval(() => setToast(null), 8000)
+    }, [toast])
 
     const mode = stats ? stats.mode : 'auto'
     const current = stats ? stats.current : null
@@ -128,6 +151,12 @@ export function apply(ctx) {
       Object.keys(byModel || {}).length > 0 ? createElement('details', { className: 'mrtr-details' },
         createElement('summary', null, 'usage (' + (totals ? totals.calls : 0) + ' calls)'),
         modelRows) : null,
+      toast ? createElement('div', { className: 'mrtr-toast', onClick: () => setToast(null) },
+        createElement('div', { className: 'mrtr-toast-title' },
+          '⚡ quick-answer 已完成（' + (toast.model || 'cheap model') + '）'),
+        toast.preview ? createElement('div', { className: 'mrtr-toast-body' }, toast.preview + ' …') : null,
+        createElement('div', { className: 'mrtr-toast-hint' }, '答案已回填对话 · 点击关闭'),
+      ) : null,
     )
   }
 

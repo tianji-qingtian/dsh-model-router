@@ -59,6 +59,12 @@ const modelRecordSchema = z.object({
 const projectionSchema = z.object({
   mode: z.string(),
   quickAnswers: z.number(),
+  lastQuick: z.union([z.null(), z.object({
+    seq: z.number(),
+    turn: z.string(),
+    model: z.string(),
+    preview: z.string(),
+  })]),
   current: z.union([z.null(), z.object({ provider: z.string(), model: z.string() })]),
   totals: z.object({
     calls: z.number(),
@@ -177,15 +183,32 @@ export function apply(ctx) {
   ctx.sessionProjections.register({
     key: 'modelRouter',
     schema: projectionSchema,
-    init: () => ({ mode: 'auto', quickAnswers: 0, current: null, totals: emptyTotals(), byModel: {}, modelChanges: [] }),
+    init: () => ({ mode: 'auto', quickAnswers: 0, lastQuick: null, current: null, totals: emptyTotals(), byModel: {}, modelChanges: [] }),
     apply(state, event) {
       // SessionEvent shape: { type, seq, time, data: <payload>, ... } — the
       // payload lives under `data`.
       if (event.type === 'user/message') {
-        // Count quick-answer relay injections (our plugin-sourced context).
+        // Quick-answer relay injections (our plugin-sourced context):
+        // count them and remember the latest one for the toast.
         const msg = event.data
         if (msg && msg.source && msg.source.kind === 'plugin' && msg.source.plugin === 'dsh-model-router') {
-          return { ...state, quickAnswers: state.quickAnswers + 1 }
+          const id = String(msg.id || '')
+          const prefix = 'mrtr-qa-'
+          const turn = id.startsWith(prefix) && id.lastIndexOf('-') >= prefix.length
+            ? id.slice(id.lastIndexOf('-') + 1)
+            : ''
+          const model = id.startsWith(prefix) && id.lastIndexOf('-') >= prefix.length
+            ? id.slice(prefix.length, id.lastIndexOf('-'))
+            : ''
+          const texts = Array.isArray(msg.content)
+            ? msg.content.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text)
+            : []
+          const preview = (texts.slice(1).join(' ').trim() || '').slice(0, 200)
+          return {
+            ...state,
+            quickAnswers: state.quickAnswers + 1,
+            lastQuick: { seq: Number(event.seq ?? 0), turn, model, preview },
+          }
         }
         return state
       }
@@ -295,17 +318,19 @@ export function apply(ctx) {
       state.quickKids.add(String(run.id))
       try {
         const result = await run.result
-        const output = Array.isArray(result.output) ? result.output : []
+        const output = Array.isArray(result.output)
+          ? result.output.filter((b) => b && b.type === 'text')
+          : []
         if (result.stopReason === 'completed' && output.length > 0) {
           // Re-queue the original question (claim removed it from the inbox)
           // and the relay instruction, then reject this step so the main
           // model never answers the question itself.
           for (const message of payload.messages) payload.agent.inject(message)
           payload.agent.inject({
-            id: `mrtr-qa-${agentId}-${payload.turn}-${Date.now()}`,
+            id: `mrtr-qa-${catalog.cheap}-${payload.turn}`,
             role: 'user',
             content: [
-              { type: 'text', text: 'A quick-answer subagent already answered the question above in an isolated conversation. Reply to the user with that answer exactly as written — do not re-answer, add analysis, or call tools.' },
+              { type: 'text', text: `⚡ Quick-answer subagent (${catalog.cheap}, isolated session) already answered the question above. Reply to the user with that answer exactly as written — do not re-answer, add analysis, or call tools.` },
               ...output,
             ],
             source: { kind: 'plugin', plugin: 'dsh-model-router' },
