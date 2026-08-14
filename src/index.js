@@ -3,13 +3,13 @@
  *
  * Model Router & Cost Optimizer for DeepSeek Harness.
  *
- * Routing: every agent step is classified before dispatch (`agent/pre-step`:
- * tool-call depth + keyword + payload size heuristics) and the model for the
- * request is replaced through the `agent/request` waterfall — trivial steps
- * run on the cheap catalog model, agentic work stays on the strong one. The
- * chosen tier is sticky within a turn so the provider's prefix cache is not
- * thrashed by mid-turn flips (every model switch pays a full-miss rebuild of
- * that model's cache).
+ * Quick answers: in `agent/pre-step`, clearly heavy work (strong keywords /
+ * long payloads) takes the normal flow directly; everything else is judged
+ * by a zero-prefix flash call (SIMPLE / AGENTIC). SIMPLE requests are
+ * answered by a zero-prefix flash stream and written straight into the
+ * session log — the main model never runs for them and its prefix cache is
+ * never touched. AGENTIC requests (including context-dependent follow-ups)
+ * take the normal flow.
  *
  * Fallback: transient failures (RATE_LIMIT / SERVER / TIMEOUT /
  * EMPTY_RESPONSE) mark the agent degraded for the turn and return
@@ -24,8 +24,8 @@
  * model-class price table. Being a projection, the numbers are replay-safe
  * and survive cold sessions.
  *
- * Manual control: `/router auto|cheap|strong` slash command and the
- * model-visible `route_model` tool (the agent can switch its own tier).
+ * Manual control: `/router auto|off` slash command and the model-visible
+ * `route_model` tool toggle quick-answering per session.
  */
 import z from 'zod'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -132,14 +132,13 @@ function lastAssistantText(session) {
   return ''
 }
 
-function classify(messages) {
+function isHeavy(messages) {
   // Fast path ONLY for clearly heavy work — everything else is decided by
   // the cheap-model judge, so a fragile keyword list can never misroute a
-  // simple question. Only the newest USER message is inspected; mid-turn
-  // steps end with assistant/tool messages and stay on the sticky tier.
-  if (!Array.isArray(messages) || messages.length === 0) return 'auto'
+  // simple question. Only the newest USER message is inspected.
+  if (!Array.isArray(messages) || messages.length === 0) return false
   const last = messages[messages.length - 1]
-  if (!last || last.role !== 'user') return 'auto'
+  if (!last || last.role !== 'user') return false
   const content = last.content
   let text = ''
   let toolBlocks = 0
@@ -154,7 +153,7 @@ function classify(messages) {
   const strongWords = /(实现|重构|修复|调试|排查|设计|架构|优化|审计|迁移|评审|implement|refactor|debug|design|architect|migrate|audit|investigate|analy[sz]e)/gi
   score += (text.match(strongWords) || []).length
   if (text.length > 4000) score += 1
-  return score >= 2 ? 'strong' : 'auto'
+  return score >= 2
 }
 
 const emptyTotals = () => ({
@@ -165,10 +164,8 @@ export function apply(ctx) {
   // ---- live routing state (process-local; durable stats live in the projection) ----
   const state = {
     globalMode: 'auto',
-    agentModes: new Map(), // agentId -> 'auto' | 'cheap' | 'strong'
+    agentModes: new Map(), // agentId -> 'auto' | 'off'
     degraded: new Map(),   // agentId -> turn number where degraded began
-    sticky: new Map(),     // agentId -> { turn, tier }
-    preStep: new Map(),    // agentId -> { turn, tier }
     fallbacks: 0,
     baseModel: new Map(),  // agentId -> machine's original model
     provider: new Map(),   // agentId -> provider route
@@ -347,7 +344,7 @@ export function apply(ctx) {
       }
       if (event.type === 'command/run' && event.data && event.data.name === 'router') {
         const args = String(event.data.args || '').trim().toLowerCase()
-        const mode = ['auto', 'cheap', 'strong'].includes(args) ? args : null
+        const mode = ['auto', 'off'].includes(args) ? args : null
         if (mode === null || state.mode === mode) return state
         return { ...state, mode }
       }
@@ -359,7 +356,7 @@ export function apply(ctx) {
     stateVersion: 1,
   })
 
-  // ---- classify each step; cheap questions are answered directly on flash ----
+  // ---- quick answers: judge simple questions and answer them on flash ----
   ctx.on('agent/pre-step', async (payload, next) => {
     const agentId = String(payload.agent.id)
     try {
@@ -370,19 +367,15 @@ export function apply(ctx) {
     }
 
     const mode = state.agentModes.get(agentId) || state.globalMode
-    if (mode !== 'auto') return next() // manual mode owns routing entirely
+    if (mode !== 'auto') return next() // 'off' → quick answers disabled
 
-    const tier = classify(payload.messages)
-    if (tier === 'strong') {
-      state.preStep.set(agentId, { turn: payload.turn, tier: 'strong' })
-      return next()
-    }
+    if (isHeavy(payload.messages)) return next() // heavy work: normal flow, no judge latency
 
-    // Not clearly heavy: let the cheap model judge SIMPLE vs AGENTIC, then
-    // answer SIMPLE requests with a zero-prefix one-shot stream on the cheap
-    // model, written straight into the session log inside a forged step
-    // envelope. No subagent session (nothing piles up in the sidebar), no
-    // relay card, and the main model never runs for simple questions.
+    // Let the cheap model judge SIMPLE vs AGENTIC, then answer SIMPLE
+    // requests with a zero-prefix one-shot stream on the cheap model, written
+    // straight into the session log inside a forged step envelope. No
+    // subagent session, no relay card, and the main model never runs for
+    // simple questions.
     try {
       // Only genuine user turns: every claimed message must be user-sourced
       // (tool results / steering / injections are excluded).
@@ -415,6 +408,7 @@ export function apply(ctx) {
         reason: 'change',
       })
       session.append('step/start', { turn: payload.turn, step: payload.step })
+      const quickLabel = /[\u4e00-\u9fff]/.test(question) ? '快速回答' : 'Quick answer'
       const assistantEvent = {
         turn: payload.turn,
         step: payload.step,
@@ -423,7 +417,7 @@ export function apply(ctx) {
           role: 'assistant',
           content: [{
             type: 'text',
-            text: `> ⚡ 快速回答 · ${catalog.cheap}\n\n${answer.text}`,
+            text: `> ⚡ ${quickLabel} · ${catalog.cheap}\n\n${answer.text}`,
           }],
           source: { kind: 'model', provider, model: catalog.cheap },
         },
@@ -439,7 +433,7 @@ export function apply(ctx) {
     return next()
   })
 
-  // ---- the router itself ----
+  // ---- request router: degraded fallback + drift healing ----
   ctx.on('agent/request', async (payload, next) => {
     const base = await next()
     if (!base || !base.provider || !base.model) return base
@@ -448,42 +442,26 @@ export function apply(ctx) {
     state.baseModel.set(agentId, base.model)
     const turn = payload.turn
 
-    let tier = null
-    let reason = null
-    const mode = state.agentModes.get(agentId) || state.globalMode
-    if (mode !== 'auto') { tier = mode; reason = 'manual' }
-    else if (state.degraded.get(agentId) === turn) { tier = 'cheap'; reason = 'degraded' }
-    else {
-      const sticky = state.sticky.get(agentId)
-      if (sticky && sticky.turn === turn) { tier = sticky.tier; reason = 'sticky' }
-      else {
-        const pre = state.preStep.get(agentId)
-        if (pre && pre.turn === turn) { tier = pre.tier; reason = 'heuristic' }
-      }
-    }
-    // No routing decision: heal drift back to the machine's default. A
-    // forged quick-answer header (or a stale persisted header after resume)
-    // must never stick — the agent's configured options are the anchor.
-    if (tier === null || tier === 'auto' || tier === 'base') {
-      const options = payload.agent && payload.agent.options
-      if (options && options.model) {
-        const provider = options.provider || base.provider
-        if (provider && (base.model !== options.model || base.provider !== provider)) {
-          return { ...base, provider, model: options.model }
-        }
+    // Degraded fallback (transient failures): route this turn's retry cheap.
+    if (state.degraded.get(agentId) === turn) {
+      const catalog = await getCatalog(base.provider)
+      if (catalog.cheap && catalog.cheap !== base.model) {
+        return { ...base, model: catalog.cheap }
       }
       return base
     }
 
-    const catalog = await getCatalog(base.provider)
-    const target = tier === 'cheap' ? catalog.cheap : catalog.strong
-    if (!target || target === base.model) {
-      state.sticky.set(agentId, { turn, tier: 'base' })
-      return base
+    // Heal drift back to the machine's default. A forged quick-answer header
+    // (or a stale persisted header after resume) must never stick — the
+    // agent's configured options are the anchor.
+    const options = payload.agent && payload.agent.options
+    if (options && options.model) {
+      const provider = options.provider || base.provider
+      if (provider && (base.model !== options.model || base.provider !== provider)) {
+        return { ...base, provider, model: options.model }
+      }
     }
-    state.sticky.set(agentId, { turn, tier })
-    console.log(`dsh-model-router: #${turn} ${base.model} -> ${target} (${reason})`)
-    return { ...base, model: target }
+    return base
   })
 
   // ---- fallback on transient provider failures ----
@@ -511,34 +489,33 @@ export function apply(ctx) {
 
   ctx.on('llm/adapters-updated', () => { state.catalogCache.clear() })
 
-  // ---- /router slash command: manual tier control ----
+  // ---- /router slash command: toggle quick answers ----
   const commands = ctx.get('commands')
   if (commands !== undefined) {
     commands.register({
       name: 'router',
-      description: 'set the model routing tier for this session (auto | cheap | strong)',
-      input: { hint: 'auto|cheap|strong' },
+      description: 'enable or disable quick answers for this session (auto | off)',
+      input: { hint: 'auto|off' },
       handler: (invocation) => {
         const arg = String(invocation.rawInput || '').trim().toLowerCase()
-        const tier = ['auto', 'cheap', 'strong'].includes(arg) ? arg : null
-        if (tier === null) return { kind: 'error', text: 'usage: /router auto|cheap|strong' }
-        const agentId = String(invocation.agent.id)
-        state.agentModes.set(agentId, tier)
-        return { kind: 'success', text: `model router tier set to "${tier}" for this session` }
+        const mode = ['auto', 'off'].includes(arg) ? arg : null
+        if (mode === null) return { kind: 'error', text: 'usage: /router auto|off' }
+        state.agentModes.set(String(invocation.agent.id), mode)
+        return { kind: 'success', text: `quick answers ${mode === 'auto' ? 'enabled' : 'disabled'} for this session` }
       },
     })
   }
 
-  // ---- route_model tool: the agent can switch its own tier ----
+  // ---- route_model tool: the agent can toggle quick answers ----
   ctx.tools.register(defineTool({
     name: 'route_model',
-    description: 'Set the model tier used for the following steps of this session. cheap picks the cheapest catalog model (faster, lower cost), strong picks the strongest one, auto restores heuristic routing. Use when the task clearly deserves a stronger or cheaper model than the router is currently using.',
+    description: 'Enable or disable the quick-answer router for this session. auto judges simple questions and answers them on the cheap model; off routes everything through the main model.',
     parameters: {
       tier: {
         type: 'string',
         required: true,
-        enum: ['auto', 'cheap', 'strong'],
-        description: "Routing tier for this session: 'auto' heuristic, 'cheap' cheapest model, 'strong' strongest model.",
+        enum: ['auto', 'off'],
+        description: "Quick-answer mode for this session: 'auto' enable, 'off' disable.",
       },
     },
     output: {
@@ -546,39 +523,33 @@ export function apply(ctx) {
         type: 'object',
         additionalProperties: false,
         properties: {
-          tier: { type: 'string' },
+          mode: { type: 'string' },
           cheap: { type: 'string' },
-          strong: { type: 'string' },
           note: { type: 'string' },
         },
       },
       render(args, value) {
         const v = value || {}
-        const summary = 'model router tier: ' + String(v.tier || '?')
-          + (v.cheap ? ', cheap=' + v.cheap : '')
-          + (v.strong ? ', strong=' + v.strong : '')
+        const summary = 'quick answers: ' + String(v.mode || '?')
+          + (v.cheap ? ', cheap model=' + v.cheap : '')
           + (v.note ? ' — ' + v.note : '')
         return [{ type: 'text', text: summary }]
       },
     },
     async execute(args, exec) {
-      const tier = args && args.tier
-      if (!['auto', 'cheap', 'strong'].includes(tier)) {
-        return { tier: String(tier), cheap: null, strong: null, note: 'invalid tier; use auto | cheap | strong' }
+      const mode = args && args.tier
+      if (!['auto', 'off'].includes(mode)) {
+        return { mode: String(mode), cheap: null, note: 'invalid mode; use auto | off' }
       }
       const agent = exec && exec.agent
-      if (!agent) {
-        state.globalMode = tier
-      } else {
-        state.agentModes.set(String(agent.id), tier)
-      }
+      if (!agent) state.globalMode = mode
+      else state.agentModes.set(String(agent.id), mode)
       const provider = agent ? state.provider.get(String(agent.id)) : null
-      const catalog = provider ? await getCatalog(provider) : { cheap: null, strong: null }
+      const catalog = provider ? await getCatalog(provider) : { cheap: null }
       return {
-        tier,
+        mode,
         cheap: catalog.cheap,
-        strong: catalog.strong,
-        note: 'applies from the next model request; auto restores heuristic routing',
+        note: mode === 'auto' ? 'quick answers enabled' : 'quick answers disabled',
       }
     },
   }))

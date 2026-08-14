@@ -2,16 +2,15 @@
  * dsh-model-router — client half.
  *
  * A compact panel in the composer dock (`conversation.composer.dock`):
- * tier buttons (Auto / 省 / 强), the currently active model, live per-session
+ * an Auto / 关闭 (off) toggle, the currently active model, live per-session
  * token / cache-hit / cost figures, a per-model usage breakdown, and a brief
  * inline highlight whenever a question is answered directly on the cheap
  * model (the answer itself appears in the chat as an ordinary message).
  *
- * All read-side data flows through the `modelRouter` session projection
- * (standard `useProjection` slot prop — no RPC, reactive updates). The tier
- * buttons execute the `/router` slash command through the harness's existing
- * commands remote (`ctx.remote.commands.execute`), so no custom wire protocol
- * is invented here.
+ * UI text is localized through the harness `locale` service (zh + en). Read
+ * data flows through the `modelRouter` session projection (standard
+ * `useProjection` slot prop — no RPC). The toggle executes the `/router`
+ * slash command through the harness's existing `commands` remote.
  */
 import { createElement, useEffect, useRef, useState } from 'react'
 
@@ -62,18 +61,56 @@ const fmtCost = (c) => {
   return c.toFixed(c < 0.1 ? 4 : 2)
 }
 
+const ZH = {
+  'mode.auto': 'Auto',
+  'mode.off': '关闭',
+  'mode.auto.title': '自动：简单问题由 flash 直接作答，重活走主模型',
+  'mode.off.title': '关闭快速回答：所有请求都走主模型',
+  'qa.title': '由便宜模型直接作答的问题数',
+  'flash.done': '已作答',
+  'usage.calls': '用量',
+}
+const EN = {
+  'mode.auto': 'Auto',
+  'mode.off': 'Off',
+  'mode.auto.title': 'Auto: simple questions answered directly on the cheap model, heavy work uses the main model',
+  'mode.off.title': 'Disable quick answers: route everything through the main model',
+  'qa.title': 'questions answered directly on the cheap model',
+  'flash.done': 'answered',
+  'usage.calls': 'usage',
+}
+
 export function apply(ctx) {
   injectStyle()
+
+  const locale = ctx.get('locale')
+  let t = (key) => key
+  if (locale) {
+    try {
+      locale.register('dsh-model-router', 'zh', ZH)
+      locale.register('dsh-model-router', 'en', EN)
+      t = locale.bind('dsh-model-router')
+    } catch (error) {
+      console.error('dsh-model-router: locale registration failed: ' + String(error))
+    }
+  }
 
   function RouterDock(props) {
     const stats = props.useProjection('modelRouter')
     const sessionId = props.sessionId ? String(props.sessionId) : ''
     const [busy, setBusy] = useState(false)
     const [flash, setFlash] = useState(null)
+    const [, setLocaleTick] = useState(0)
     const lastQuickSeq = useRef(-1)
 
-    // Briefly highlight in the bar when a new quick answer lands (inline,
-    // not a floating toast — the answer itself is already in the chat).
+    // Re-render on locale switch.
+    useEffect(() => {
+      const loc = ctx.get('locale')
+      if (!loc || typeof loc.subscribe !== 'function') return undefined
+      return loc.subscribe(() => setLocaleTick((x) => x + 1))
+    }, [])
+
+    // Briefly highlight when a new quick answer lands (inline, not a toast).
     useEffect(() => {
       const q = stats && stats.lastQuick ? stats.lastQuick.seq : -1
       if (q >= 0 && q !== lastQuickSeq.current) {
@@ -91,29 +128,27 @@ export function apply(ctx) {
     const current = stats ? stats.current : null
     const totals = stats ? stats.totals : null
     const byModel = stats ? stats.byModel : null
-    // inputTokens excludes cache reads (disjoint harness counts): the hit rate
-    // is hit / (hit + miss).
     const totalPrompt = totals ? totals.inTokens + totals.cacheRead : 0
     const cacheHitRate = totalPrompt > 0
       ? Math.round((totals.cacheRead / totalPrompt) * 100)
       : 0
 
-    const setMode = (tier) => {
+    const setMode = (next) => {
       setBusy(true)
       const remote = ctx.get('remote')
       const run = remote && remote.commands
-        ? remote.commands.execute(sessionId, '/router ' + tier)
+        ? remote.commands.execute(sessionId, '/router ' + next)
         : Promise.reject(new Error('commands remote unavailable'))
       run.catch(() => {}).finally(() => setBusy(false))
     }
 
-    const modeBtn = (tier, label, title) => createElement('button', {
-      key: tier,
+    const modeBtn = (value, label, title) => createElement('button', {
+      key: value,
       type: 'button',
-      className: 'mrtr-btn' + (mode === tier ? ' mrtr-btn-active' : ''),
+      className: 'mrtr-btn' + (mode === value ? ' mrtr-btn-active' : ''),
       title,
       disabled: busy || sessionId === '',
-      onClick: () => setMode(tier),
+      onClick: () => setMode(value),
     }, label)
 
     const modelRows = Object.keys(byModel || {}).sort().map((model) => {
@@ -121,7 +156,7 @@ export function apply(ctx) {
       return createElement('div', { key: model, className: 'mrtr-row' },
         createElement('span', { className: 'mrtr-mono' }, model),
         createElement('span', { className: 'mrtr-meta' },
-          m.calls + ' calls · miss ' + fmt(m.inTokens) + ' · out ' + fmt(m.outTokens)
+          m.calls + ' · miss ' + fmt(m.inTokens) + ' · out ' + fmt(m.outTokens)
           + ' · cache ' + fmt(m.cacheRead)),
       )
     })
@@ -129,21 +164,20 @@ export function apply(ctx) {
     return createElement('div', { className: 'mrtr' },
       createElement('div', { className: 'mrtr-bar' },
         createElement('span', { className: 'mrtr-label' }, '⚡Router'),
-        modeBtn('auto', 'Auto', 'auto: trivial questions answered by an isolated quick-answer agent on the cheap model'),
-        modeBtn('cheap', '省', 'force the cheapest catalog model'),
-        modeBtn('strong', '强', 'force the strongest catalog model'),
+        modeBtn('auto', t('mode.auto'), t('mode.auto.title')),
+        modeBtn('off', t('mode.off'), t('mode.off.title')),
         current ? createElement('span', {
           className: 'mrtr-chip',
           title: current.provider + ' / ' + current.model,
         }, current.model) : null,
         stats && stats.quickAnswers > 0 ? createElement('span', {
           className: 'mrtr-meta',
-          title: 'trivial questions answered directly on the cheap model',
+          title: t('qa.title'),
         }, 'QA×' + stats.quickAnswers) : null,
         flash ? createElement('span', {
           className: 'mrtr-flash',
-          title: 'this question was answered directly on the cheap model',
-        }, '⚡' + (flash.model || 'flash') + ' 已作答') : null,
+          title: t('qa.title'),
+        }, '⚡' + (flash.model || 'flash') + ' ' + t('flash.done')) : null,
         totals ? createElement('span', { className: 'mrtr-meta', title: 'estimated cost; input excludes cache hits (disjoint counts), prices are configurable estimates' },
           'miss ' + fmt(totals.inTokens)
           + ' · out ' + fmt(totals.outTokens)
@@ -151,7 +185,7 @@ export function apply(ctx) {
           + ' · ≈$' + fmtCost(totals.cost)) : null,
       ),
       Object.keys(byModel || {}).length > 0 ? createElement('details', { className: 'mrtr-details' },
-        createElement('summary', null, 'usage (' + (totals ? totals.calls : 0) + ' calls)'),
+        createElement('summary', null, t('usage.calls') + ' (' + (totals ? totals.calls : 0) + ')'),
         modelRows) : null,
     )
   }

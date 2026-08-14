@@ -1,17 +1,19 @@
 # dsh-model-router
 
-Model Router & Cost Optimizer for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`). Routes every agent step to the cheapest sufficient model, degrades gracefully on transient provider failures, and shows live per-session token / cache-hit / cost figures right under the composer.
+Model Router & Cost Optimizer for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`). Answers simple questions directly on the cheap model (zero prefix, no cache tax), degrades gracefully on transient provider failures, and shows live per-session token / cache-hit / cost figures right under the composer.
 
 > The harness is in developer preview and iterates quickly — expect compatibility-breaking changes.
 
+> 中文说明见 [README.zh.md](README.zh.md)。
+
 ## Features
 
-- **Cheap-model judge routing** — clearly heavy work (strong keywords / long payloads) goes straight to the strong model with zero added latency. Everything else is decided by a **zero-prefix flash judge call** (`SIMPLE` / `AGENTIC`, one word, ~16-token cap): SIMPLE requests are answered directly on the cheap model, AGENTIC ones take the normal flow. A hand-written keyword list can never misroute a simple question again.
-- **Direct quick-answer** — SIMPLE prompts are *not* answered by the main session at all. The router rejects the step, runs a **zero-prefix one-shot stream on the cheap model** (no cache-miss tax), and writes the question + answer straight into the session log inside a step envelope — the user sees an ordinary Q&A exchange prefixed with a `⚡ 快速回答 · <model>` marker, the main model never runs for it, and **no subagent sessions, relay cards, or toasts are created**. The main session's model and prefix cache are never touched. Manual mode (`/router`, `route_model`, dock buttons) disables quick-answering.
+- **Cheap-model judge routing** — clearly heavy work (strong keywords / long payloads) goes straight to the main model with zero added latency. Everything else is decided by a **zero-prefix flash judge call** (`SIMPLE` / `AGENTIC`, one word, 64-token cap, thinking off): SIMPLE requests are answered directly on the cheap model, AGENTIC ones take the normal flow. The judge also sees the last assistant reply, so context-dependent follow-ups (它 / 这个 / 继续 …) are never misrouted to a context-free answer.
+- **Direct quick-answer** — SIMPLE prompts are *not* answered by the main session at all. The router rejects the step, runs a **zero-prefix one-shot stream on the cheap model** (no cache-miss tax), and writes the question + answer straight into the session log inside a step envelope — the user sees an ordinary Q&A exchange prefixed with a `⚡ 快速回答 / Quick answer · <model>` marker (matched to the question language), the main model never runs for it, and **no subagent sessions, relay cards, or toasts are created**. The main session's model and prefix cache are never touched.
+- **Auto / off toggle** — the dock panel and `/router auto|off` (plus the `route_model` tool) simply enable or disable quick-answering for the session. There is no per-request model flipping to configure.
 - **Automatic fallback** — transient failures (`RATE_LIMIT`, `SERVER`, `TIMEOUT`, `EMPTY_RESPONSE`) degrade the turn to the cheap model and retry once; anything else delegates to the provider's own retry policy.
 - **Real usage metering** — a session projection folds the durable log: real adapter token usage (input / output / cache read / cache write / reasoning), per-model breakdown, and estimated cost from a model-class price table. Projection-based, so the numbers are replay-safe and survive cold sessions.
-- **Composer dock panel** — tier buttons (Auto / 省 / 强), current model, `miss/out/cache%/≈$` line, a `QA×N` quick-answer counter (with a brief inline highlight on each direct answer), and a per-model usage breakdown. Reactively driven by `useProjection`; buttons reuse the built-in `commands` remote — no custom wire protocol.
-- **Manual control** — `/router auto|cheap|strong` slash command, and a model-visible `route_model` tool so the agent itself can request a tier mid-task.
+- **Composer dock panel (i18n zh/en)** — Auto / 关闭 toggle, current model, `miss/out/cache%/≈$` line, a `QA×N` quick-answer counter (with a brief inline highlight on each direct answer), and a per-model usage breakdown. Reactively driven by `useProjection`; the toggle reuses the built-in `commands` remote — no custom wire protocol. UI strings are localized through the harness `locale` service.
 
 ## Install
 
@@ -45,13 +47,13 @@ After the restart the ⚡Router panel appears under the composer in the Web UI, 
 
 | Piece | Mechanism |
 | --- | --- |
-| Step classification | `agent/pre-step` waterfall — strong-keyword fast path, then a zero-prefix flash judge call (SIMPLE / AGENTIC) |
+| Step classification | `agent/pre-step` waterfall — strong-keyword fast path, then a zero-prefix flash judge call (SIMPLE / AGENTIC) with the last assistant reply for reference detection |
 | Quick answers | `agent/pre-step` rejects the step after a zero-prefix `llm.stream` on the cheap model; the question + answer are appended to the session log (`user/message` + a forged `step/start`…`assistant/message`…`step/end` envelope) — the main model never runs |
-| Model substitution (strong/manual tiers) | `agent/request` waterfall — replaces the call config's `model` |
+| Drift healing | `agent/request` restores the agent's configured model whenever no routing decision applies (a forged header or stale persisted header never sticks) |
 | Failure fallback | `agent/request-error` waterfall — returns `{ kind: 'retry' }` after flagging the turn; the retry re-enters `agent/request` and lands on the cheap model |
 | Stats | `sessionProjections.register('modelRouter', …)` folded over `request/header`, `command/run`, and `assistant/message` events (usage + `mrtr-ans-` quick answers) |
-| Dock UI | `conversation.composer.dock` slot + standard `useProjection` prop |
-| Manual control | `/router` command (`commands` service) + `route_model` tool (`tools` registry) |
+| Dock UI | `conversation.composer.dock` slot + standard `useProjection` prop + `locale` service for zh/en text |
+| Manual control | `/router auto|off` command (`commands` service) + `route_model` tool (`tools` registry) |
 
 The cheap/strong model pair is discovered at runtime from the provider's catalog (`llm.listModels`): ids matching `flash|chat|mini|turbo|haiku|lite|air|nano` are cheap candidates, `pro|reasoner|opus|sonnet|max|ultra|premium|r1` are strong. With the stock DeepSeek adapter that is `deepseek-v4-flash` ↔ `deepseek-v4-pro`.
 
