@@ -408,6 +408,36 @@ export function apply(ctx) {
       const verdict = await flashJudge(provider, catalog.cheap, question, context, payload.signal)
       if (verdict !== 'cheap') return next()
 
+      // Auto mode asks the user on every SIMPLE hit: quick answer or main
+      // model. Subagent sessions (DELEGATED_CALLER), a missing UI provider,
+      // or a dismissed/empty answer all fall back to the normal flow.
+      const zh = /[\u4e00-\u9fff]/.test(question)
+      const quickChoice = zh ? '⚡ 快速回答（flash）' : '⚡ Quick answer (flash)'
+      const userQuestions = ctx.get('userQuestions')
+      if (userQuestions === undefined) return next()
+      let choice
+      try {
+        const answer = await userQuestions.ask({
+          questions: [{
+            id: 'route',
+            question: zh ? '这条问题用哪种方式回答？' : 'How should this question be answered?',
+            options: [
+              { label: quickChoice, description: zh ? '更快、成本更低' : 'faster and cheaper' },
+              { label: zh ? '主模型回答' : 'Main model', description: zh ? '质量更高，带完整上下文' : 'higher quality, full context' },
+            ],
+          }],
+          agent: payload.agent,
+          signal: payload.signal,
+        })
+        const item = Array.isArray(answer && answer.answers)
+          ? answer.answers.find((a) => a && a.id === 'route')
+          : null
+        choice = item && Array.isArray(item.selected) ? item.selected[0] : undefined
+      } catch (error) {
+        console.error(`dsh-model-router: user question failed: ${String(error)}`)
+      }
+      if (choice !== quickChoice) return next()
+
       const answer = await answerOnCheap(provider, catalog.cheap, question, payload.signal)
       if (answer === null) return next()
 
