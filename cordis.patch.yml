@@ -1,0 +1,10 @@
+# dsh-model-router profile bundle patch (declared by the `dsh.bundle.patch`
+# manifest field): applied when this package appears in a profile's
+# `dsh.profile.bundles` list.
+#
+# One host row; the browser half is discovered automatically through the
+# package.json `dsh.client` declaration (served at /plugins/dsh-model-router/client.js).
+
+- insert:
+    - id: model-router
+      name: 'dsh-model-router'
