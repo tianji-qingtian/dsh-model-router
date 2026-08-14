@@ -108,13 +108,17 @@ export function apply(ctx) {
     return createElement('div', { className: 'mrtr' },
       createElement('div', { className: 'mrtr-bar' },
         createElement('span', { className: 'mrtr-label' }, '⚡Router'),
-        modeBtn('auto', 'Auto', 'heuristic routing: trivial steps run on the cheap model'),
+        modeBtn('auto', 'Auto', 'auto: trivial questions answered by an isolated quick-answer agent on the cheap model'),
         modeBtn('cheap', '省', 'force the cheapest catalog model'),
         modeBtn('strong', '强', 'force the strongest catalog model'),
         current ? createElement('span', {
           className: 'mrtr-chip',
           title: current.provider + ' / ' + current.model,
         }, current.model) : null,
+        stats && stats.quickAnswers > 0 ? createElement('span', {
+          className: 'mrtr-meta',
+          title: 'trivial questions answered by an isolated quick-answer agent on the cheap model',
+        }, 'QA×' + stats.quickAnswers) : null,
         totals ? createElement('span', { className: 'mrtr-meta', title: 'estimated cost; input excludes cache hits (disjoint counts), prices are configurable estimates' },
           'miss ' + fmt(totals.inTokens)
           + ' · out ' + fmt(totals.outTokens)

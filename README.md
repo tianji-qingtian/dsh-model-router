@@ -6,8 +6,8 @@ Model Router & Cost Optimizer for [DeepSeek Harness](https://github.com/deepseek
 
 ## Features
 
-- **Heuristic tier routing** — at turn start the *newest user message* is classified (`agent/pre-step`: task keywords + payload size; history is deliberately ignored so a long agentic conversation can still route a trivial follow-up cheap). Trivial prompts (是什么 / 解释 / 翻译 / hello …) go to the cheap catalog model; agentic work (实现 / 重构 / 调试 …) stays on the strong one. The chosen tier is **sticky within a turn**.
-- **Switch-cost hysteresis** — every model flip pays a full-prefix cache miss on the target model (a long cached session is cheapest *staying put*). So cheap routing engages only after **two consecutive cheap-classified turns**, while heavy turns switch back immediately. Manual mode (`/router`, `route_model`, dock buttons) bypasses the hysteresis.
+- **Heuristic tier routing** — at turn start the *newest user message* is classified (`agent/pre-step`: task keywords + payload size; history is deliberately ignored so a long agentic conversation can still catch a trivial follow-up). Agentic work (实现 / 重构 / 调试 …) routes to the strong catalog model. The chosen tier is **sticky within a turn**.
+- **Isolated quick-answer** — trivial prompts (是什么 / 解释 / 翻译 / hello …) are *not* answered by the main session at all. The router rejects the step, spawns a **fresh `quick-answer` subagent on the cheap model** (zero prefix → no cache-miss tax), and feeds its answer back into the conversation as a plugin context card; the main model relays it verbatim. The main session's model and prefix cache are never touched, so there is no switching penalty in long cached sessions — the trade-off is one extra relay call instead of a model flip. Manual mode (`/router`, `route_model`, dock buttons) disables quick-answering.
 - **Automatic fallback** — transient failures (`RATE_LIMIT`, `SERVER`, `TIMEOUT`, `EMPTY_RESPONSE`) degrade the turn to the cheap model and retry once; anything else delegates to the provider's own retry policy.
 - **Real usage metering** — a session projection folds the durable log: real adapter token usage (input / output / cache read / cache write / reasoning), per-model breakdown, and estimated cost from a model-class price table. Projection-based, so the numbers are replay-safe and survive cold sessions.
 - **Composer dock panel** — tier buttons (Auto / 省 / 强), current model, `miss/out/cache%/≈$` line, and a per-model usage breakdown. Reactively driven by `useProjection`; buttons reuse the built-in `commands` remote — no custom wire protocol.
@@ -45,10 +45,11 @@ After the restart the ⚡Router panel appears under the composer in the Web UI, 
 
 | Piece | Mechanism |
 | --- | --- |
-| Step classification | `agent/pre-step` waterfall (read-only observer) |
-| Model substitution | `agent/request` waterfall — replaces the call config's `model` |
+| Step classification | `agent/pre-step` waterfall — newest user message, keyword + size heuristics |
+| Quick answers | `agent/pre-step` rejects the step after spawning a one-shot `subagents.start` child on the cheap model; the child's answer is re-injected via `agent.inject` and relayed by the main model |
+| Model substitution (strong/manual tiers) | `agent/request` waterfall — replaces the call config's `model` |
 | Failure fallback | `agent/request-error` waterfall — returns `{ kind: 'retry' }` after flagging the turn; the retry re-enters `agent/request` and lands on the cheap model |
-| Stats | `sessionProjections.register('modelRouter', …)` folded over `request/header`, `command/run`, and `assistant/message` events |
+| Stats | `sessionProjections.register('modelRouter', …)` folded over `request/header`, `command/run`, `user/message` (quick-answer count), and `assistant/message` events |
 | Dock UI | `conversation.composer.dock` slot + standard `useProjection` prop |
 | Manual control | `/router` command (`commands` service) + `route_model` tool (`tools` registry) |
 
@@ -71,9 +72,9 @@ Edit it to match your account's actual pricing; the panel always labels the numb
 
 ## Known limitations
 
-- The router is a static plugin: routing state (mode, degradation, streak) is process-local and resets with the harness. Durable numbers live in the projection.
+- The router is a static plugin: routing state (mode, degradation) is process-local and resets with the harness. Durable numbers live in the projection.
 - `useProjection`-driven stats reflect the whole session log — history recorded before installation is included, which is intentional.
-- The switch-cost hysteresis is a fixed 2-turn heuristic. A precise switch-aware cost model (compare expected savings against the target model's prefix-miss rebuild cost, driven by the projection's real cache numbers) is planned as a follow-up.
+- Quick answers add one relay call (the main model restates the child's answer), so for very short answers the total cost is roughly break-even vs. answering on the strong model; the win grows with answer length and with heavy contexts where a model flip would be expensive.
 
 ## License
 

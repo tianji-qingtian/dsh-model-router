@@ -30,7 +30,7 @@
 import z from 'zod'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
-export const inject = ['llm', 'tools', 'sessionProjections']
+export const inject = ['llm', 'tools', 'sessionProjections', 'subagents']
 
 const CHEAP_RE = /(flash|chat|mini|turbo|haiku|lite|air|nano)/i
 const STRONG_RE = /(pro|reasoner|opus|sonnet|max|ultra|premium|r1)/i
@@ -58,6 +58,7 @@ const modelRecordSchema = z.object({
 
 const projectionSchema = z.object({
   mode: z.string(),
+  quickAnswers: z.number(),
   current: z.union([z.null(), z.object({ provider: z.string(), model: z.string() })]),
   totals: z.object({
     calls: z.number(),
@@ -92,6 +93,15 @@ function usageCost(model, usage) {
   return (input / 1e6) * price.input
     + (cacheRead / 1e6) * price.cacheHit
     + (output / 1e6) * price.output
+}
+
+function newestText(message) {
+  if (!message || !Array.isArray(message.content)) return ''
+  let text = ''
+  for (const b of message.content) {
+    if (b && b.type === 'text' && typeof b.text === 'string') text += b.text + ' '
+  }
+  return text.trim()
 }
 
 function classify(messages) {
@@ -135,7 +145,7 @@ export function apply(ctx) {
     degraded: new Map(),   // agentId -> turn number where degraded began
     sticky: new Map(),     // agentId -> { turn, tier }
     preStep: new Map(),    // agentId -> { turn, tier }
-    cheapStreak: new Map(),// agentId -> consecutive cheap-classified turns
+    quickKids: new Set(),  // agentIds of quick-answer children (recursion guard)
     fallbacks: 0,
     baseModel: new Map(),  // agentId -> machine's original model
     provider: new Map(),   // agentId -> provider route
@@ -167,10 +177,18 @@ export function apply(ctx) {
   ctx.sessionProjections.register({
     key: 'modelRouter',
     schema: projectionSchema,
-    init: () => ({ mode: 'auto', current: null, totals: emptyTotals(), byModel: {}, modelChanges: [] }),
+    init: () => ({ mode: 'auto', quickAnswers: 0, current: null, totals: emptyTotals(), byModel: {}, modelChanges: [] }),
     apply(state, event) {
       // SessionEvent shape: { type, seq, time, data: <payload>, ... } — the
       // payload lives under `data`.
+      if (event.type === 'user/message') {
+        // Count quick-answer relay injections (our plugin-sourced context).
+        const msg = event.data
+        if (msg && msg.source && msg.source.kind === 'plugin' && msg.source.plugin === 'dsh-model-router') {
+          return { ...state, quickAnswers: state.quickAnswers + 1 }
+        }
+        return state
+      }
       if (event.type === 'request/header') {
         const cfg = event.data && event.data.header && event.data.header.config
         if (!cfg) return state
@@ -225,31 +243,82 @@ export function apply(ctx) {
     stateVersion: 1,
   })
 
-  // ---- classify each step; clear the per-turn degraded flag ----
-  ctx.on('agent/pre-step', (payload, next) => {
+  // ---- classify each step; route cheap questions to a quick-answer child ----
+  ctx.on('agent/pre-step', async (payload, next) => {
+    const agentId = String(payload.agent.id)
     try {
-      const agentId = String(payload.agent.id)
       const degTurn = state.degraded.get(agentId)
       if (degTurn !== undefined && degTurn !== payload.turn) state.degraded.delete(agentId)
-      const tier = classify(payload.messages)
-      // Switch-cost hysteresis: flipping models costs a full-prefix cache
-      // miss on the target model, so a single trivial turn in a long
-      // cached session is NOT worth switching. Require two consecutive
-      // cheap-classified turns before routing cheap; heavy turns switch
-      // back immediately.
-      let effective = 'auto'
-      if (tier === 'cheap') {
-        const streak = Math.min((state.cheapStreak.get(agentId) || 0) + 1, 3)
-        state.cheapStreak.set(agentId, streak)
-        effective = streak >= 2 ? 'cheap' : 'auto'
-      } else if (tier === 'strong') {
-        state.cheapStreak.set(agentId, 0)
-        effective = 'strong'
-      }
-      if (effective !== 'auto') state.preStep.set(agentId, { turn: payload.turn, tier: effective })
-      else state.preStep.delete(agentId)
     } catch (error) {
-      console.error(`dsh-model-router: pre-step failed: ${String(error)}`)
+      console.error(`dsh-model-router: pre-step cleanup failed: ${String(error)}`)
+    }
+
+    const mode = state.agentModes.get(agentId) || state.globalMode
+    if (mode !== 'auto') return next() // manual mode owns routing entirely
+    if (state.quickKids.has(agentId)) return next() // never re-spawn from a child
+
+    const tier = classify(payload.messages)
+    if (tier === 'strong') {
+      state.preStep.set(agentId, { turn: payload.turn, tier: 'strong' })
+      return next()
+    }
+    if (tier !== 'cheap') return next()
+
+    // Cheap question: answer it in a fresh quick-answer child on the cheap
+    // model (zero prefix -> no cache-miss tax), then feed the answer back
+    // into this conversation. The main session never flips model, so its
+    // prefix cache stays intact.
+    try {
+      // Only genuine user turns: every claimed message must be user-sourced
+      // (tool results / steering / our own relay injections are excluded).
+      if (payload.messages.length === 0
+        || !payload.messages.every((m) => m && m.source && m.source.kind === 'user')) return next()
+      const question = newestText(payload.messages[payload.messages.length - 1])
+      if (!question) return next()
+      const provider = state.provider.get(agentId) || String(payload.agent.options?.provider || '')
+      if (!provider) return next()
+      const catalog = await getCatalog(provider)
+      if (!catalog.cheap) return next()
+      const subagentProviders = ctx.subagents.list()
+      if (!Array.isArray(subagentProviders) || subagentProviders.length === 0) return next()
+
+      const run = await ctx.subagents.start(subagentProviders[0], {
+        label: 'quick-answer',
+        prompt: [{
+          type: 'text',
+          text: 'Answer the following question directly and concisely. Do not use tools. Output only the answer.\n\n' + question,
+        }],
+        parent: payload.agent,
+        signal: payload.signal,
+        agentOptions: { provider, model: catalog.cheap },
+      })
+      state.quickKids.add(String(run.id))
+      try {
+        const result = await run.result
+        const output = Array.isArray(result.output) ? result.output : []
+        if (result.stopReason === 'completed' && output.length > 0) {
+          // Re-queue the original question (claim removed it from the inbox)
+          // and the relay instruction, then reject this step so the main
+          // model never answers the question itself.
+          for (const message of payload.messages) payload.agent.inject(message)
+          payload.agent.inject({
+            id: `mrtr-qa-${agentId}-${payload.turn}-${Date.now()}`,
+            role: 'user',
+            content: [
+              { type: 'text', text: 'A quick-answer subagent already answered the question above in an isolated conversation. Reply to the user with that answer exactly as written — do not re-answer, add analysis, or call tools.' },
+              ...output,
+            ],
+            source: { kind: 'plugin', plugin: 'dsh-model-router' },
+          })
+          console.log(`dsh-model-router: quick-answer #${payload.turn} via ${catalog.cheap}`)
+          return { kind: 'reject' }
+        }
+      } finally {
+        await run.dispose().catch(() => {})
+        state.quickKids.delete(String(run.id))
+      }
+    } catch (error) {
+      console.error(`dsh-model-router: quick-answer failed: ${String(error)}`)
     }
     return next()
   })
@@ -327,7 +396,6 @@ export function apply(ctx) {
         if (tier === null) return { kind: 'error', text: 'usage: /router auto|cheap|strong' }
         const agentId = String(invocation.agent.id)
         state.agentModes.set(agentId, tier)
-        state.cheapStreak.set(agentId, tier === 'cheap' ? 3 : 0)
         return { kind: 'success', text: `model router tier set to "${tier}" for this session` }
       },
     })
@@ -374,9 +442,7 @@ export function apply(ctx) {
       if (!agent) {
         state.globalMode = tier
       } else {
-        const agentId = String(agent.id)
-        state.agentModes.set(agentId, tier)
-        state.cheapStreak.set(agentId, tier === 'cheap' ? 3 : 0)
+        state.agentModes.set(String(agent.id), tier)
       }
       const provider = agent ? state.provider.get(String(agent.id)) : null
       const catalog = provider ? await getCatalog(provider) : { cheap: null, strong: null }
