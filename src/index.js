@@ -180,8 +180,8 @@ export function apply(ctx) {
 
   /**
    * Zero-prefix one-shot answer on the cheap model. Returns the plain text
-   * or null when the stream produced nothing (caller falls back to the
-   * normal flow).
+   * plus the adapter's usage, or null when the stream produced nothing
+   * (caller falls back to the normal flow).
    */
   async function answerOnCheap(provider, model, question, signal) {
     const stream = ctx.llm.stream({
@@ -200,14 +200,16 @@ export function apply(ctx) {
       signal,
     })
     const blocks = []
+    let usage = null
     for await (const chunk of stream) {
+      if (chunk.type === 'usage') usage = chunk.usage
       if (chunk.type === 'block-end' && chunk.block && chunk.block.type === 'text'
         && typeof chunk.block.text === 'string') {
         blocks.push(chunk.block.text)
       }
     }
     const text = blocks.join('\n\n').trim()
-    return text.length > 0 ? text : null
+    return text.length > 0 ? { text, usage } : null
   }
 
   // ---- session projection: durable per-session stats folded from the log ----
@@ -219,18 +221,19 @@ export function apply(ctx) {
       // SessionEvent shape: { type, seq, time, data: <payload>, ... } — the
       // payload lives under `data`.
       if (event.type === 'assistant/message') {
-        // Direct quick answers (forged step, id prefix mrtr-ans-): count
-        // them and remember the latest one for the panel indicator.
         const data = event.data
         const message = data && data.message
+        let next = state
+        // Direct quick answers (forged step, id prefix mrtr-ans-): count
+        // them and remember the latest one for the panel indicator.
         if (message && typeof message.id === 'string' && message.id.startsWith('mrtr-ans-')) {
           const model = (message.source && message.source.model) ? String(message.source.model) : ''
           const texts = Array.isArray(message.content)
             ? message.content.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text)
             : []
-          return {
-            ...state,
-            quickAnswers: state.quickAnswers + 1,
+          next = {
+            ...next,
+            quickAnswers: next.quickAnswers + 1,
             lastQuick: {
               seq: Number(event.seq ?? 0),
               turn: String((data && data.turn) || ''),
@@ -239,14 +242,14 @@ export function apply(ctx) {
             },
           }
         }
-        if (event.data && event.data.usage) {
-          const u = event.data.usage
-          const model = String((state.current && state.current.model) || 'unknown')
-          const prev = state.byModel[model] || {
+        if (data && data.usage) {
+          const u = data.usage
+          const model = String((next.current && next.current.model) || 'unknown')
+          const prev = next.byModel[model] || {
             calls: 0, inTokens: 0, outTokens: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0,
           }
           const byModel = {
-            ...state.byModel,
+            ...next.byModel,
             [model]: {
               calls: prev.calls + 1,
               inTokens: prev.inTokens + (u.inputTokens || 0),
@@ -257,17 +260,17 @@ export function apply(ctx) {
             },
           }
           const totals = {
-            calls: state.totals.calls + 1,
-            inTokens: state.totals.inTokens + (u.inputTokens || 0),
-            outTokens: state.totals.outTokens + (u.outputTokens || 0),
-            cacheRead: state.totals.cacheRead + (u.cacheReadTokens || 0),
-            cacheWrite: state.totals.cacheWrite + (u.cacheWriteTokens || 0),
-            reasoning: state.totals.reasoning + (u.reasoningTokens || 0),
-            cost: state.totals.cost + usageCost(model, u),
+            calls: next.totals.calls + 1,
+            inTokens: next.totals.inTokens + (u.inputTokens || 0),
+            outTokens: next.totals.outTokens + (u.outputTokens || 0),
+            cacheRead: next.totals.cacheRead + (u.cacheReadTokens || 0),
+            cacheWrite: next.totals.cacheWrite + (u.cacheWriteTokens || 0),
+            reasoning: next.totals.reasoning + (u.reasoningTokens || 0),
+            cost: next.totals.cost + usageCost(model, u),
           }
-          return { ...state, byModel, totals }
+          return { ...next, byModel, totals }
         }
-        return state
+        return next
       }
       if (event.type === 'request/header') {
         const cfg = event.data && event.data.header && event.data.header.config
@@ -336,22 +339,29 @@ export function apply(ctx) {
 
       // Log the exchange. At pre-step time the current step has not started
       // yet, so step/start..assistant/message..step/end with payload.step
-      // satisfies the session invariants.
+      // satisfies the session invariants. A request/header for the cheap
+      // route makes the projection attribute the usage below to flash.
       const session = payload.agent.session
       for (const message of payload.messages) {
         session.append('user/message', message, { surfaceOp: 'append' })
       }
+      session.append('request/header', {
+        header: { config: { provider, model: catalog.cheap } },
+        reason: 'change',
+      })
       session.append('step/start', { turn: payload.turn, step: payload.step })
-      session.append('assistant/message', {
+      const assistantEvent = {
         turn: payload.turn,
         step: payload.step,
         message: {
           id: `mrtr-ans-${agentId}-${payload.turn}-${payload.step}`,
           role: 'assistant',
-          content: [{ type: 'text', text: answer }],
+          content: [{ type: 'text', text: answer.text }],
           source: { kind: 'model', provider, model: catalog.cheap },
         },
-      }, { surfaceOp: 'append' })
+      }
+      if (answer.usage) assistantEvent.usage = answer.usage
+      session.append('assistant/message', assistantEvent, { surfaceOp: 'append' })
       session.append('step/end', { turn: payload.turn, step: payload.step })
       console.log(`dsh-model-router: quick-answer #${payload.turn} via ${catalog.cheap} (direct)`)
       return { kind: 'reject' }

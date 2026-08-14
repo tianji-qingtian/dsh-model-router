@@ -74,7 +74,7 @@ Edit it to match your account's actual pricing; the panel always labels the numb
 
 - The router is a static plugin: routing state (mode, degradation) is process-local and resets with the harness. Durable numbers live in the projection.
 - `useProjection`-driven stats reflect the whole session log — history recorded before installation is included, which is intentional.
-- Direct quick answers write a forged step envelope into the session log. This satisfies the current session invariants (the step is appended before the real step starts), but it is the most harness-coupled part of the plugin — worth re-checking after harness upgrades. The cheap-model tokens of quick answers are deliberately not included in the panel's usage figures.
+- Direct quick answers write a forged step envelope (plus a `request/header` for attribution) into the session log. This satisfies the current session invariants (the step is appended before the real step starts), but it is the most harness-coupled part of the plugin — worth re-checking after harness upgrades.
 
 ## License
 
