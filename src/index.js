@@ -163,8 +163,10 @@ export function apply(ctx) {
     schema: projectionSchema,
     init: () => ({ mode: 'auto', current: null, totals: emptyTotals(), byModel: {}, modelChanges: [] }),
     apply(state, event) {
+      // SessionEvent shape: { type, seq, time, data: <payload>, ... } — the
+      // payload lives under `data`.
       if (event.type === 'request/header') {
-        const cfg = event.header && event.header.config
+        const cfg = event.data && event.data.header && event.data.header.config
         if (!cfg) return state
         const next = { provider: String(cfg.provider || ''), model: String(cfg.model || '') }
         const cur = state.current
@@ -175,14 +177,14 @@ export function apply(ctx) {
         changes.push({ seq: Number(event.seq ?? 0), provider: next.provider, model: next.model })
         return { ...state, current: next, modelChanges: changes }
       }
-      if (event.type === 'command/run' && event.name === 'router') {
-        const args = String(event.args || '').trim().toLowerCase()
+      if (event.type === 'command/run' && event.data && event.data.name === 'router') {
+        const args = String(event.data.args || '').trim().toLowerCase()
         const mode = ['auto', 'cheap', 'strong'].includes(args) ? args : null
         if (mode === null || state.mode === mode) return state
         return { ...state, mode }
       }
-      if (event.type === 'assistant/message' && event.usage) {
-        const u = event.usage
+      if (event.type === 'assistant/message' && event.data && event.data.usage) {
+        const u = event.data.usage
         const model = String((state.current && state.current.model) || 'unknown')
         const prev = state.byModel[model] || {
           calls: 0, inTokens: 0, outTokens: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0,
