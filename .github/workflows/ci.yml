@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.14.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Smoke check (host exports)
+        run: node -e "import('./lib/index.js').then(m => { if (typeof m.apply !== 'function' || !Array.isArray(m.inject)) { console.error('bad host exports', Object.keys(m)); process.exit(1) } console.log('host exports ok:', Object.keys(m).join(', ')) })"
+
+      - name: Smoke check (client bundle shape)
+        run: node -e "const s = require('fs').readFileSync('lib/client.js', 'utf8'); if (!s.includes('window.__ModuleLoader__.load')) { console.error('client bundle missing ModuleLoader handoff'); process.exit(1) } if (!s.includes('exports.apply')) { console.error('client bundle missing apply export'); process.exit(1) } console.log('client bundle ok')"
