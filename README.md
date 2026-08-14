@@ -14,11 +14,24 @@ Model Router & Cost Optimizer for [DeepSeek Harness](https://github.com/deepseek
 
 ## Install
 
+### Prerequisites
+
+The `dsh` CLI must be on your `PATH` (`dsh plugin` forwards to pnpm). If you only ever ran the harness through `npx`, `dsh` is not installed and you will get `zsh: command not found: dsh` — install it globally first:
+
+```sh
+pnpm add -g @deepseek-ai/dsh   # or: npm install -g @deepseek-ai/dsh
+```
+
+Or skip the global install and prefix the commands below with `npx @deepseek-ai/dsh …`.
+
+### Add the bundle
+
 ```sh
 # 1. add the bundle to your web profile (pnpm-backed; runs the package's prepare build)
 dsh plugin --profile web add "github:tianji-qingtian/dsh-model-router#main"
 
-# 2. restart the harness with that profile
+# 2. restart the harness with that profile — `add` only edits the profile
+#    files; a running instance does not hot-load the new bundle
 dsh --profile web
 ```
 
