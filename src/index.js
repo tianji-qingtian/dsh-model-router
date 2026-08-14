@@ -124,7 +124,7 @@ function classify(messages) {
   }
   let score = Math.min(toolBlocks, 8) * 0.5
   const strongWords = /(实现|重构|修复|调试|排查|设计|架构|优化|审计|迁移|评审|implement|refactor|debug|design|architect|migrate|audit|investigate|analy[sz]e)/gi
-  const cheapWords = /(你好|是什么|什么意思|解释|总结|翻译|写首诗|讲个笑话|推荐|打招呼|hello|what is|explain|summarize|translate)/gi
+  const cheapWords = /(你好|什么是|是什么|什么意思|解释|总结|翻译|写首诗|讲个笑话|推荐|打招呼|hello|what is|explain|summarize|translate)/gi
   score += (text.match(strongWords) || []).length
   score -= (text.match(cheapWords) || []).length
   if (text.length > 4000) score += 1
