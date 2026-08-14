@@ -95,12 +95,17 @@ function usageCost(model, usage) {
 }
 
 function classify(messages) {
-  if (!Array.isArray(messages)) return 'auto'
+  if (!Array.isArray(messages) || messages.length === 0) return 'auto'
+  // Only the newest USER message decides the turn tier. Scanning the whole
+  // step history lets old keywords dominate: a long agentic conversation
+  // would never route a trivial follow-up question cheap. Mid-turn steps
+  // end with assistant/tool messages — leave those to the sticky tier.
+  const last = messages[messages.length - 1]
+  if (!last || last.role !== 'user') return 'auto'
+  const content = last.content
   let text = ''
   let toolBlocks = 0
-  for (const m of messages) {
-    const content = m && m.content
-    if (!Array.isArray(content)) continue
+  if (Array.isArray(content)) {
     for (const b of content) {
       if (!b || typeof b !== 'object') continue
       if (b.type === 'text' && typeof b.text === 'string') text += b.text + ' '
@@ -130,6 +135,7 @@ export function apply(ctx) {
     degraded: new Map(),   // agentId -> turn number where degraded began
     sticky: new Map(),     // agentId -> { turn, tier }
     preStep: new Map(),    // agentId -> { turn, tier }
+    cheapStreak: new Map(),// agentId -> consecutive cheap-classified turns
     fallbacks: 0,
     baseModel: new Map(),  // agentId -> machine's original model
     provider: new Map(),   // agentId -> provider route
@@ -226,7 +232,21 @@ export function apply(ctx) {
       const degTurn = state.degraded.get(agentId)
       if (degTurn !== undefined && degTurn !== payload.turn) state.degraded.delete(agentId)
       const tier = classify(payload.messages)
-      if (tier !== 'auto') state.preStep.set(agentId, { turn: payload.turn, tier })
+      // Switch-cost hysteresis: flipping models costs a full-prefix cache
+      // miss on the target model, so a single trivial turn in a long
+      // cached session is NOT worth switching. Require two consecutive
+      // cheap-classified turns before routing cheap; heavy turns switch
+      // back immediately.
+      let effective = 'auto'
+      if (tier === 'cheap') {
+        const streak = Math.min((state.cheapStreak.get(agentId) || 0) + 1, 3)
+        state.cheapStreak.set(agentId, streak)
+        effective = streak >= 2 ? 'cheap' : 'auto'
+      } else if (tier === 'strong') {
+        state.cheapStreak.set(agentId, 0)
+        effective = 'strong'
+      }
+      if (effective !== 'auto') state.preStep.set(agentId, { turn: payload.turn, tier: effective })
       else state.preStep.delete(agentId)
     } catch (error) {
       console.error(`dsh-model-router: pre-step failed: ${String(error)}`)
@@ -305,7 +325,9 @@ export function apply(ctx) {
         const arg = String(invocation.rawInput || '').trim().toLowerCase()
         const tier = ['auto', 'cheap', 'strong'].includes(arg) ? arg : null
         if (tier === null) return { kind: 'error', text: 'usage: /router auto|cheap|strong' }
-        state.agentModes.set(String(invocation.agent.id), tier)
+        const agentId = String(invocation.agent.id)
+        state.agentModes.set(agentId, tier)
+        state.cheapStreak.set(agentId, tier === 'cheap' ? 3 : 0)
         return { kind: 'success', text: `model router tier set to "${tier}" for this session` }
       },
     })
@@ -349,8 +371,13 @@ export function apply(ctx) {
         return { tier: String(tier), cheap: null, strong: null, note: 'invalid tier; use auto | cheap | strong' }
       }
       const agent = exec && exec.agent
-      if (!agent) state.globalMode = tier
-      else state.agentModes.set(String(agent.id), tier)
+      if (!agent) {
+        state.globalMode = tier
+      } else {
+        const agentId = String(agent.id)
+        state.agentModes.set(agentId, tier)
+        state.cheapStreak.set(agentId, tier === 'cheap' ? 3 : 0)
+      }
       const provider = agent ? state.provider.get(String(agent.id)) : null
       const catalog = provider ? await getCatalog(provider) : { cheap: null, strong: null }
       return {

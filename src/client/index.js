@@ -100,7 +100,7 @@ export function apply(ctx) {
       return createElement('div', { key: model, className: 'mrtr-row' },
         createElement('span', { className: 'mrtr-mono' }, model),
         createElement('span', { className: 'mrtr-meta' },
-          m.calls + ' calls · in ' + fmt(m.inTokens) + ' · out ' + fmt(m.outTokens)
+          m.calls + ' calls · miss ' + fmt(m.inTokens) + ' · out ' + fmt(m.outTokens)
           + ' · cache ' + fmt(m.cacheRead)),
       )
     })
